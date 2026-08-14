@@ -12,103 +12,105 @@
 ░████                                              ░████ 
 ```
 
-**一个做减法的 AI 编程副驾驶**
+**An AI coding copilot built on subtraction**
 
-2.5 MB 单文件 · 零依赖 · 即放即用 · 即删即走
+2.5 MB single file · zero dependencies · drop in and go · delete and it's gone
+
+**English** | [中文](README.zh-CN.md)
 
 </div>
 
 ---
 
-## 理念
+## Philosophy
 
-> **AI 只是副驾驶，把程序员的还给程序员。**
+> **AI is the copilot. Give programming back to programmers.**
 
-市面上 AI 开发工具在做加法：接管 shell、接管 git、接管你的整个工作流。
-DoAgent 做减法——它只有 6 个工具，不碰 shell，不碰 git，不做任何"自作聪明"的事。
-写代码它帮忙，**掌控权永远在你手里**。
+Most AI dev tools keep adding: they take over your shell, your git, your whole workflow.
+DoAgent subtracts — it has only 6 tools, never touches shell, never touches git, and does nothing "clever" behind your back.
+It helps you write code. **Control stays with you.**
 
-- **超轻量**：单文件静态二进制，约 2.5 MB，冷启动毫秒级
-- **随处可用**：服务器、Docker、边缘设备——`scp` 上去就能跑
-- **绿色便携**：程序和配置同住一个文件夹，卸载 = 删文件夹，零残留
+- **Featherweight**: a single static binary, ~2.5 MB, millisecond cold start
+- **Runs anywhere**: servers, Docker, edge devices — `scp` it over and it works
+- **Truly portable**: the program and its config live in one folder; uninstall = delete the folder, zero residue
 
-## 它只有 6 个工具
+## Only 6 tools
 
-| 工具 | 干什么 |
+| Tool | What it does |
 |---|---|
-| `read` / `write` / `edit` | 读写改文件 |
-| `ls` / `grep` | 看目录、搜内容 |
-| `start` | 执行**你配置的**那一条命令（构建 / 类型检查），把结果喂给 AI |
+| `read` / `write` / `edit` | read, write, and patch files |
+| `ls` / `grep` | list directories, search content |
+| `start` | runs the **one command you configured** (build / typecheck) and feeds the output back to the AI |
 
-没有 bash。AI 拿编译反馈的唯一途径是 `start`——命令由你定，它只能按。
+No bash. The AI's only channel for compiler feedback is `start` — you pick the command, it can only press the button.
 
-## 安全设计：工作区即边界
+## Safety: the workspace is the boundary
 
-- 启动时所在的目录就是全部世界，任何工具无法跳出（realpath 级校验，symlink 也出不去）
-- 配置目录 `.do/` 对 AI **完全隐形**——读写报"文件不存在"，ls 不显示，grep 跳过
-- 全局配置在 exe 旁边，物理上在工作区之外，AI 够不到
+- The launch directory is the whole world; no tool can escape it (realpath-level checks — symlinks can't get out either)
+- The config dir `.do/` is **completely invisible** to the AI — reads report "file not found", `ls` omits it, `grep` skips it
+- Global config sits next to the binary, physically outside the workspace, out of the AI's reach
 
-## 快速开始
+## Quick start
 
-```powershell
-# 1. 放到一个固定目录（比如 C:\tools），加进 PATH
-# 2. 任意项目目录里启动
+```bash
+# 1. Drop do into a fixed directory (e.g. C:\tools or /usr/local/bin) and add it to PATH
+# 2. Launch inside any project directory
 do
 ```
 
 ```
-/setting -g url https://你的OpenAI兼容API地址
+/setting -g url https://your-openai-compatible-endpoint
 /setting -g key sk-xxxxxxxx
-/setting -g model 模型名
-/setting start cargo build      ← 告诉它这个项目的编译命令
+/setting -g model your-model
+/setting start cargo build      ← tell it how this project compiles
 ```
 
-然后直接说话就行："帮我看看 src/main.rs 的错误"。
+Then just talk: "check the error in src/main.rs".
 
-## 命令与快捷键
+## Commands & keys
 
-| 输入 | 作用 |
+| Input | Action |
 |---|---|
-| `/setting [-g] <url\|key\|model\|start> <值>` | 改配置（带 `-g` 写全局） |
-| `/new` | 新对话（自动接续 HANDOFF.md 交接文档） |
-| `/quit` 或 `Ctrl+C` | 退出 |
-| `Ctrl+E` | 展开/折叠思考过程与工具调用 |
-| `PageUp / PageDown` | 滚动历史 |
+| `/setting [-g] <url\|key\|model\|start> <value>` | change config (`-g` writes the global layer) |
+| `/new` | new conversation (auto-resumes from HANDOFF.md) |
+| `/quit` or `Ctrl+C` | exit |
+| `Ctrl+E` | expand/collapse thinking & tool calls |
+| `PageUp / PageDown` | scroll history |
 
-## 配置：两层，各管各的
+## Config: two layers, two jobs
 
-| 层 | 位置 | 存什么 |
+| Layer | Location | Holds |
 |---|---|---|
-| 工作区（优先） | `项目\.do\config.json` | `start` + 本项目专属覆盖 |
-| 全局（便携） | `do.exe` 旁的 `do.config.json` | `url` / `key` / `model` |
+| Workspace (wins) | `project/.do/config.json` | `start` + per-project overrides |
+| Global (portable) | `do.config.json` next to the binary | `url` / `key` / `model` |
 
-全局配一次身份，每个项目只配一条 `start`。
-某个项目要用不同的 key？项目里 `/setting key ...`（不带 `-g`）覆盖即可。
+Set your identity once globally; each project only needs its `start` command.
+Need a different key for one project? `/setting key ...` (no `-g`) overrides it there.
 
-## 上下文管理：/new 即压缩
+## Context: /new is the compaction
 
-没有黑盒的自动总结。AI 被要求随时维护一份 `HANDOFF.md`（目标/进展/决策/下一步），
-你看着状态栏的 token 估算，觉得该换上下文了，`/new` 一下——
-历史清空，交接文档自动成为新对话的第一条消息。**何时压缩，你说了算。**
+No black-box auto-summaries. The AI is instructed to maintain a `HANDOFF.md` (goal / progress / decisions / next step).
+Watch the token estimate in the status bar; when you decide it's time, `/new` —
+history clears, and the handoff doc becomes the first message of the new conversation. **You decide when to compact.**
 
-## 卸载
+## Uninstall
 
 ```
-删掉放 do.exe 的那个文件夹。
+Delete the folder that holds do.
 ```
 
-就这一件事。没有注册表，没有后台服务，没有藏在 `%APPDATA%` 里的惊喜。
+That's it. No registry, no background services, no surprises hidden in `%APPDATA%`.
 
-## 自己构建
+## Build it yourself
 
 ```bash
-cargo build --release   # 需要 Rust 工具链
+cargo build --release   # requires the Rust toolchain
 ```
 
-产物：`target/release/do`（Windows 下 `do.exe`）。
+Output: `target/release/do` (`do.exe` on Windows).
 
 ---
 
 <div align="center">
-工具应该像一把好扳手：拿起就用，放下就走。
+A tool should be like a good wrench: pick it up, use it, put it down.
 </div>
