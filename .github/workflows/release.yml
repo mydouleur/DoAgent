@@ -1,0 +1,75 @@
+# CI 与发布流水线
+#
+# 教学点：GitHub Actions 的 job 模型 ≈ 一组并行跑的脚本容器。
+# - 每次 push / PR：跑 test + clippy（质量门禁）
+# - 打 v* 标签：在三种 OS 上构建 release 二进制，并自动挂到 GitHub Release 页面
+# 矩阵（matrix）≈ C# 里对一组配置 foreach 并行执行同一套步骤。
+name: CI & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: # 允许在 Actions 页面手动触发
+
+jobs:
+  # 质量门禁：任何提交都必须测试全绿 + clippy 零警告
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2 # 缓存 target/，增量编译提速一个量级
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings # 警告升级为错误
+
+  # 发布构建：只在打标签或手动触发时运行
+  build:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false # 一个平台失败不取消其他平台
+      matrix:
+        include:
+          # Windows 桌面用户
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: do-windows-x86_64.exe
+          # 常规 Linux 服务器（glibc）
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: do-linux-x86_64
+          # 静态 musl 版：Docker scratch/distroless、Alpine、老发行版的通吃答案
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            name: do-linux-x86_64-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # musl 目标需要 musl 工具链（ring 的 C 代码要用 musl-gcc 编）
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      # 统一产物名：Windows 产物带 .exe，其余不带
+      - name: Package
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/do"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          mkdir -p dist && cp "$BIN" "dist/${{ matrix.name }}"
+          ls -la dist/
+      # 构建产物先存为 artifact（手动触发时也能下载）
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/
+      # 打标签时：把三个平台的二进制挂到 Release 页面
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/*
