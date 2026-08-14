@@ -1,0 +1,17 @@
+[package]
+name = "do"
+version = "0.1.0"
+edition = "2021"
+
+# 前端：TUI（ratatui + crossterm），通过 core 的 actor 通道驱动对话。
+
+[dependencies]
+# 包名 core 与 Rust 内置的 core 库同名，引用时起别名 agent_core 避免遮蔽
+# （否则 tokio 宏展开里的 ::core::future 会解析到我们的 crate 上）
+agent_core = { package = "core", path = "../core" }
+tokio.workspace = true
+serde.workspace = true
+ratatui = { workspace = true, features = ["crossterm"] }
+crossterm.workspace = true
+unicode-width.workspace = true
+futures-util.workspace = true

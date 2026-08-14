@@ -1,0 +1,7 @@
+# Rust 构建产物
+/target
+
+# 运行期产物（DoAgent 自己也是自己的工作区时会产生）
+.do/
+do.config.json
+HANDOFF.md

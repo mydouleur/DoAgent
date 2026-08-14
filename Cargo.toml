@@ -1,0 +1,37 @@
+# DoAgent 工作区根清单
+#
+# cargo workspace：一个仓库里放多个 crate（Rust 的编译单元/库包，
+# 概念上类似 C# 解决方案里的多个 .csproj 项目）。
+# members 声明成员 crate；workspace.dependencies 统一依赖版本，
+# 子 crate 里用 `xxx.workspace = true` 引用，避免版本漂移。
+
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/do"]
+
+[workspace.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "process", "time", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+eventsource-stream = "0.2"
+futures-util = { version = "0.3", default-features = false }
+ratatui = { version = "0.29", default-features = false }
+crossterm = "0.28"
+regex-lite = "0.1"
+ignore = "0.4"
+unicode-width = "0.2"
+
+# release 优化档：以体积极小化为目标（本项目的硬指标是 do.exe ≤ 2.6 MB）
+# opt-level="z"   优先缩小体积（比 "s" 更激进），≈ C# 的 Optimize 但更狠
+# lto="fat"       跨 crate 全量链接期优化，能抹平 core/do 的 crate 边界
+# codegen-units=1 单编译单元，换来最彻底的优化（代价是编译变慢）
+# strip=true      剥离符号表（≈ 不生成 .pdb）
+# panic="abort"   panic 直接终止进程、不展开栈，省掉 unwind 代码；
+#                 代价是 panic 时 RAII 析构不执行，所以 TUI 用 panic hook 恢复终端
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
