@@ -12,9 +12,10 @@
 ░████                                              ░████ 
 ```
 
-**An AI coding copilot built on subtraction**
+**3 MB. Any SSH session. Edits anything, runs nothing.**
+**You review, you execute, you decide.**
 
-2.5 MB single file · zero dependencies · drop in and go · delete and it's gone
+An AI coding tool built on subtraction — zero dependencies, drop in and go, delete and it's gone
 
 **English** | [中文](README.zh-CN.md)
 
@@ -24,13 +25,13 @@
 
 ## Philosophy
 
-> **AI is the copilot. Give programming back to programmers.**
+> **AI proposes, you dispose. Give programming back to programmers.**
 
 Most AI dev tools keep adding: they take over your shell, your git, your whole workflow.
 DoAgent subtracts — it has only 6 tools, never touches shell, never touches git, and does nothing "clever" behind your back.
 It helps you write code. **Control stays with you.**
 
-- **Featherweight**: a single static binary, ~2.5 MB, millisecond cold start
+- **Featherweight**: a single static binary, ~3 MB, millisecond cold start
 - **Runs anywhere**: servers, Docker, edge devices — `scp` it over and it works
 - **Truly portable**: the program and its config live in one folder; uninstall = delete the folder, zero residue
 
