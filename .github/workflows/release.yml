@@ -6,6 +6,10 @@
 # 矩阵（matrix）≈ C# 里对一组配置 foreach 并行执行同一套步骤。
 name: CI & Release
 
+# GITHUB_TOKEN 默认是只读的；创建 Release 需要显式声明写权限
+permissions:
+  contents: write
+
 on:
   push:
     branches: [main]
@@ -68,8 +72,21 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: dist/
-      # 打标签时：把三个平台的二进制挂到 Release 页面
+
+  # 发布：单独一个 job 统一创建 Release。
+  # 为什么不让三个 build job 各自上传？它们并行跑会同时抢建同一个 Release（竞态），
+  # 而且每个 job 重复创建也脆。改成 build 只传 artifact，这里收齐后一次性挂上去。
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: do-*
+          path: dist
+          merge-multiple: true # 三个 artifact 平铺进 dist/
+      - run: ls -la dist/
       - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: dist/*
