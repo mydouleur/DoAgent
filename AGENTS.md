@@ -22,5 +22,6 @@ cargo clippy --all-targets  # 必须零警告
 1. **`.do/` 对 AI 隐形**：read/edit/ls 返回与"不存在"逐字相同的错误；write 返回 os error 5；ls/grep 跳过。不得暴露其存在。`config.json` 与命令白名单 `commands.json` 同属 `.do/` 隐形范围
 2. **工作区 = 启动 cwd**：所有工具路径必须过 `workspace.resolve`（词法归一 + 大小写归一 + realpath 最深祖先），禁止直接拼路径
 3. **依赖克制**：加依赖前先问"std 能不能做"；体积基准 2.56 MB
-4. **注释是教材**：读者是"会 C# 的 Rust 小白"——模块导读 + 语法点对比 C# 概念，讲"为什么这么写"，不逐行翻译
-5. 改动涉及规格（工具行为、配置层、沙盒语义）时，同步更新 task.md
+4. **tools 与 system prompt 冻结**：工具列表固定 7 个（read/write/edit/ls/grep/addcmd/runcmd），批准的白名单命令一律走 `runcmd` 发现式调用，**不得**把动态内容注入 tools 数组或 system prompt——prompt 缓存按 system+tools+messages 前缀匹配，前缀一动全量 miss
+5. **注释是教材**：读者是"会 C# 的 Rust 小白"——模块导读 + 语法点对比 C# 概念，讲"为什么这么写"，不逐行翻译
+6. 改动涉及规格（工具行为、配置层、沙盒语义）时，同步更新 task.md

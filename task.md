@@ -89,7 +89,13 @@ tools 数组永远冻结为这 7 个：prompt 缓存按 system + tools + message
 ░████                                              ░████ 
                                                          
 
-## 待思考调整（记录）
+## 演进记录（已完成的批次，仅存档）
 
-**1-7 已完成并清理**（v0.2 批次）：①Assistant 正文 Markdown 全量渲染（pulldown-cmark，仅 do crate，+194 KB）；②思考流式可见、正文开始自动折叠；③启动 splash（任意键/1.2s 跳过）；④/setting 独立设置页（key 掩码）；⑤工具调用函数样式 `read("src/main.rs")`；⑥Esc 取消（Arc<AtomicBool>，零新依赖）；⑦工具参数派发前校验、错误回填模型自愈。批次终态：38 测试全绿、clippy 零警告、do.exe 2.76 MB。
-8. ~~**固定命令白名单 `/addcmd` `/deletecmd`**~~ ✅ 已完成：AI 用内建工具 `addcmd` 提案（name 限 `^[a-zA-Z0-9_-]+$`、mode 二态，校验失败回填模型）；`/addcmd` 审批页 command 只读、name/description 可改名再批；批准落盘 `.do/commands.json`（对 AI 隐形），`/deletecmd` 页面或带名直删；批准后 `Cmd::Notify` 以 user 角色注入历史告知模型。**后改为发现式注入（`runcmd` 工具）并弃用 start 独立工具**：tools 数组冻结为固定 7 个（read/write/edit/ls/grep/addcmd/runcmd），消除批准导致的 prompt 缓存前缀击穿——缓存按 system+tools+messages 前缀匹配，tools 不动则批准零缓存代价，白名单内容走 messages（本来逐轮增长）；`runcmd` 无参列白名单（含隐式 start 条目：config.start 非空时视图层并入，不落盘）、带名执行（once 尾 20KB / daemon 后台即返）、未知名错误附名单自愈；执行统一 shell 包装（Windows `cmd /c` / Unix `sh -c`，审批常量零拼接无注入面），cwd 固定工作区根；旧名 /addc /deletec /allowc 落入带新名的未知命令提示。slash 职责单一：`/addcmd <name> <命令全文>` 仅人类自助注册（缺参给用法提示；desc 默认空、mode 默认 once，仍须审批页 Enter 确认才落盘），`/allowcmd` 仅打开审批页处理 AI 待批提案（无提案提示）；审批页为列表视图（↑↓ 选中、青色 `>` 高亮，下方展示选中条 command 只读全文 + mode + 描述），Enter 批准 / `x` 拒绝选中条（移除后自动选中下一条、批空自动退出）、`e` 进描述编辑态（Enter 保存 / Esc 放弃）、Esc 退出且队列保留
+- **v0.2 批次（待思考 1-7）**：Markdown 全量渲染（pulldown-cmark，+194 KB）；思考流式可见/正文开始自动折叠；启动 splash；/setting 独立设置页（key 掩码）；工具调用函数样式 `read("src/main.rs")`；Esc 取消；参数校验失败回填模型自愈
+- **待思考 8（命令白名单）**：AI 用 `addcmd` 工具提案、人类 `/allowcmd` 审批（列表视图）/ `/deletecmd` 撤销、人类也可 `/addcmd <name> <命令>` 自助注册；批准落盘 `.do/commands.json`（对 AI 隐形）；**发现式注入**——tools 数组冻结为固定 7 个（read/write/edit/ls/grep/addcmd/runcmd），白名单经 `runcmd` 列出与执行，批准动作零缓存代价；start 独立工具弃用（config.start 并入白名单视图）
+
+## 待办（之后处理，现在不动手）
+
+1. **/setting 页面还有 bug**（现象待补录）
+2. **start 清理不完全**：弃用 start 独立工具后仍有残留引用/语义待排查（文档、提示文案、隐式条目边界）
+3. **splash 页美化 + 展示时长调整**（排版打磨；1.2s 自动跳过的时长再斟酌）
