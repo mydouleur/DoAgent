@@ -10,15 +10,19 @@
 //! read 限 400 行、ls 限 200 条、grep 限 100 条匹配、start 限尾部 20 KB——
 //! 超限直接在源头掐断，只把截断后的内容送回模型。
 
+use crate::commands::ApprovedCommand;
 use crate::config::Config;
 use crate::workspace::Workspace;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 
 /// 单个工具的定义：名称 + 一句话描述 + 参数 JSON Schema。
 /// 注意：tool schema 是发给模型的 token 大头，描述务必保持极简。
+/// 名称/描述用 Cow（clone-on-write ≈ C# 的"既是 string 又是 string 引用"
+/// 的类型）：内建工具借用静态字符串零分配，动态命令工具用拥有的 String。
 pub struct ToolDef {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
     pub parameters: Value,
 }
 
@@ -27,8 +31,8 @@ pub struct ToolDef {
 pub fn defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
-            name: "read",
-            description: "读文件内容。start/limit 选读行区间，默认前 400 行",
+            name: "read".into(),
+            description: "读文件内容。start/limit 选读行区间，默认前 400 行".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -40,8 +44,8 @@ pub fn defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "write",
-            description: "整文件写入（覆盖或新建）",
+            name: "write".into(),
+            description: "整文件写入（覆盖或新建）".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -52,8 +56,8 @@ pub fn defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "edit",
-            description: "精确替换：把 old 换成 new。old 不唯一时须 all=true 全部替换",
+            name: "edit".into(),
+            description: "精确替换：把 old 换成 new。old 不唯一时须 all=true 全部替换".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -66,16 +70,16 @@ pub fn defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "ls",
-            description: "列目录（最多 200 条，目录名带 / 后缀）",
+            name: "ls".into(),
+            description: "列目录（最多 200 条，目录名带 / 后缀）".into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "path": { "type": "string", "description": "默认根目录" } }
             }),
         },
         ToolDef {
-            name: "grep",
-            description: "正则搜索文件内容，返回 文件:行号: 内容，最多 100 条",
+            name: "grep".into(),
+            description: "正则搜索文件内容，返回 文件:行号: 内容，最多 100 条".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -86,11 +90,38 @@ pub fn defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "start",
-            description: "执行配置的启动/构建命令（/setting start 设置），返回输出尾部",
+            name: "start".into(),
+            description: "执行配置的启动/构建命令（/setting start 设置），返回输出尾部".into(),
             parameters: json!({ "type": "object", "properties": {} }),
         },
+        ToolDef {
+            // 命令白名单的入口：AI 只提案，人类在 TUI 审批后才生效
+            name: "propose_command".into(),
+            description: "提案一条固定命令，人类批准后成为可调用工具".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name":        { "type": "string", "description": "工具名,仅限字母数字_-" },
+                    "command":     { "type": "string", "description": "固定执行串(零参数)" },
+                    "description": { "type": "string", "description": "一句话说明" },
+                    "mode":        { "type": "string", "description": "once 一次性 / daemon 常驻" }
+                },
+                "required": ["name", "command", "description", "mode"]
+            }),
+        },
     ]
+}
+
+/// 把批准的固定命令转成动态工具定义：零参数 schema。
+/// AI 看到的就是一个无参函数，调它 = 按审批的字符串原样执行。
+pub fn command_defs(cmds: &[ApprovedCommand]) -> Vec<ToolDef> {
+    cmds.iter()
+        .map(|c| ToolDef {
+            name: Cow::Owned(c.name.clone()),
+            description: Cow::Owned(c.description.clone()),
+            parameters: json!({ "type": "object", "properties": {} }),
+        })
+        .collect()
 }
 
 /// 执行工具。返回给模型的永远是字符串：成功是结果，失败是错误文案。
@@ -104,7 +135,14 @@ pub async fn run(ws: &Workspace, name: &str, args: &Value) -> String {
         "ls" => tool_ls(ws, args),
         "grep" => tool_grep(ws, args),
         "start" => tool_start(ws).await,
-        other => format!("未知工具: {other}"),
+        // propose_command 正常由 agent 拦截（要发审批事件）；
+        // 走到这里说明漏拦，至少别把提案弄丢
+        "propose_command" => "已提交人类审批，结果待人工确认".to_string(),
+        // 内建之外的名字：查命令白名单，命中则按固定字符串执行
+        other => match crate::commands::load(ws.root()).into_iter().find(|c| c.name == other) {
+            Some(c) => run_approved(ws, &c).await,
+            None => format!("未知工具: {other}"),
+        },
     }
 }
 
@@ -298,13 +336,33 @@ async fn tool_start(ws: &Workspace) -> String {
     if cfg.start.is_empty() {
         return "未设置启动命令，请让使用者用 /setting start <命令> 设置".to_string();
     }
-    // 空白切分后 spawn：不支持管道/重定向，这是刻意的最小设计
-    let mut parts = cfg.start.split_whitespace();
-    let Some(prog) = parts.next() else {
-        return "启动命令为空".to_string();
-    };
-    let out = match tokio::process::Command::new(prog)
-        .args(parts)
+    run_once(ws, &cfg.start).await
+}
+
+/// 执行批准的固定命令：once 等结束返回输出尾部；daemon 后台 spawn 立即返回。
+/// cwd 永远固定为工作区根。
+async fn run_approved(ws: &Workspace, cmd: &ApprovedCommand) -> String {
+    if cmd.mode == "daemon" {
+        // 常驻命令：后台启动即返回。stdio 全部置空——
+        // 继承 TUI 终端会把 alternate screen 的画面对花
+        let r = shell_command(&cmd.command)
+            .current_dir(ws.root())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        return match r {
+            Ok(_) => format!("已后台启动（daemon）：{}", cmd.command),
+            Err(e) => e.to_string(),
+        };
+    }
+    run_once(ws, &cmd.command).await
+}
+
+/// once 语义：执行固定命令串，等结束，返回输出尾部 20 KB。
+/// start 与批准的动态命令共用这一条执行路径。
+async fn run_once(ws: &Workspace, cmd: &str) -> String {
+    let out = match shell_command(cmd)
         .current_dir(ws.root())
         .output()
         .await
@@ -330,6 +388,26 @@ async fn tool_start(ws: &Workspace) -> String {
         text = format!("... (前部已截断)\n{}", &text[i..]);
     }
     format!("exit code: {}\n{text}", out.status.code().unwrap_or(-1))
+}
+
+/// 用系统 shell 包装执行固定命令串（Windows `cmd /c`，Unix `sh -c`）。
+/// 为什么包一层而不是空白切分后直接 spawn：Windows 上 `npm` 实为
+/// `npm.cmd`，CreateProcess 不做 PATHEXT 查找，直接 spawn "npm" 会报
+/// "找不到文件"；`cmd /c` 才有完整的命令查找语义
+/// （≈ C# 的 ProcessStartInfo.UseShellExecute = true）。
+/// 安全性：这里执行的字符串全部来自人工审批/用户配置的**常量**，
+/// 运行时零拼接零参数——shell 包装不引入注入面。
+fn shell_command(cmd: &str) -> tokio::process::Command {
+    // cfg! 宏：编译期布尔常量，另一分支会被死代码消除
+    if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/c", cmd]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +501,64 @@ mod tests {
         let (ws, dir) = temp_ws("t7");
         let out = run(&ws, "read", &json!({"path": "../outside.txt"})).await;
         assert!(out.contains("越出工作区"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_cmds() -> Vec<ApprovedCommand> {
+        vec![
+            ApprovedCommand {
+                name: "hello".into(),
+                // "echo hello" 经 cmd /c 或 sh -c 都能跑（跨平台测试命令）
+                command: "echo hello-from-cmd".into(),
+                description: "测试用一次性命令".into(),
+                mode: "once".into(),
+            },
+            ApprovedCommand {
+                name: "srv".into(),
+                command: "echo hi".into(),
+                description: "测试用常驻命令".into(),
+                mode: "daemon".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn command_defs_are_zero_arg_tools() {
+        // 批准的命令出现在 tool schema 里：名字 + 描述 + 零参数
+        let defs = command_defs(&sample_cmds());
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "hello");
+        assert_eq!(defs[0].description, "测试用一次性命令");
+        assert!(defs[0].parameters["properties"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approved_command_executes() {
+        let (ws, dir) = temp_ws("c1");
+        crate::commands::save(&dir, &sample_cmds()).unwrap();
+        // once：真实执行，输出原样返回
+        let out = run(&ws, "hello", &json!({})).await;
+        assert!(out.contains("hello-from-cmd"), "{out}");
+        assert!(out.contains("exit code: 0"), "{out}");
+        // daemon：立即返回"已后台启动"，不等待
+        let out = run(&ws, "srv", &json!({})).await;
+        assert!(out.contains("已后台启动"), "{out}");
+        // 白名单外的名字仍是未知工具
+        let out = run(&ws, "nosuch", &json!({})).await;
+        assert!(out.contains("未知工具"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deleted_command_disappears() {
+        let (ws, dir) = temp_ws("c2");
+        crate::commands::save(&dir, &sample_cmds()).unwrap();
+        // 模拟 /deletec：移除后工具立即不可用（run 每次现读名单）
+        let mut cmds = crate::commands::load(&dir);
+        cmds.retain(|c| c.name != "hello");
+        crate::commands::save(&dir, &cmds).unwrap();
+        let out = run(&ws, "hello", &json!({})).await;
+        assert!(out.contains("未知工具"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

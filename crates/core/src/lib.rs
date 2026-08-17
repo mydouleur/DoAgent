@@ -15,6 +15,7 @@
 
 mod agent;
 mod api;
+pub mod commands; // pub：TUI 的 /addc /deletec 与测试复用
 pub mod config; // pub 给集成测试复用
 mod tools;
 pub mod workspace; // pub 给集成测试复用
@@ -22,3 +23,4 @@ pub mod workspace; // pub 给集成测试复用
 // `pub use` 把深层模块里的类型"再导出"到 crate 根部，
 // 外部就可以写 `core::AgentHandle` 而不是 `core::agent::AgentHandle`。
 pub use agent::{AgentHandle, Cmd, Evt, ToolCall, SYSTEM_PROMPT};
+pub use commands::ApprovedCommand;

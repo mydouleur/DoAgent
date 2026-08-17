@@ -19,7 +19,7 @@ cargo clippy --all-targets  # 必须零警告
 
 ## 硬性约定
 
-1. **`.do/` 对 AI 隐形**：read/edit/ls 返回与"不存在"逐字相同的错误；write 返回 os error 5；ls/grep 跳过。不得暴露其存在
+1. **`.do/` 对 AI 隐形**：read/edit/ls 返回与"不存在"逐字相同的错误；write 返回 os error 5；ls/grep 跳过。不得暴露其存在。`config.json` 与命令白名单 `commands.json` 同属 `.do/` 隐形范围
 2. **工作区 = 启动 cwd**：所有工具路径必须过 `workspace.resolve`（词法归一 + 大小写归一 + realpath 最深祖先），禁止直接拼路径
 3. **依赖克制**：加依赖前先问"std 能不能做"；体积基准 2.56 MB
 4. **注释是教材**：读者是"会 C# 的 Rust 小白"——模块导读 + 语法点对比 C# 概念，讲"为什么这么写"，不逐行翻译

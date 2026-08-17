@@ -24,7 +24,7 @@
 //!   不与缓冲区抢借用，渲染代码因此简单很多。
 
 use agent_core::config::Config;
-use agent_core::{AgentHandle, Cmd, Evt};
+use agent_core::{AgentHandle, ApprovedCommand, Cmd, Evt};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -53,8 +53,8 @@ const LOGO: &str = "\
 ░████                                              ░████ 
                                                          ";
 
-/// 三种界面模式
-#[derive(Clone, Copy, PartialEq)]
+/// 五种界面模式
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     /// 启动画面：任意键或定时器自动跳过，不强制等待
     Splash,
@@ -62,6 +62,10 @@ enum Mode {
     Chat,
     /// /setting 独立设置页
     Settings,
+    /// /addc 命令提案审批页（command 只读，name/description 可改名再批）
+    Approve,
+    /// /deletec 已批准命令删除页
+    Delete,
 }
 
 /// 对话流里的一条记录
@@ -114,6 +118,14 @@ struct Ui {
     set_editing: Option<String>,
     /// 设置页：进入时载入的各字段当前值（key 存真值，显示时才掩码）
     set_values: Vec<String>,
+    /// 待审批的命令提案队列（AI 通过 propose_command 提交，内存态不落盘）
+    pending: Vec<ApprovedCommand>,
+    /// 审批页：当前编辑字段（0=name 1=description）与表单值
+    appr_sel: usize,
+    appr_form: [String; 2],
+    /// 删除页：进入时载入的已批准命令列表与选中下标
+    del_list: Vec<ApprovedCommand>,
+    del_sel: usize,
 }
 
 /// RAII 守卫：构造时进 alternate screen + raw mode，Drop 时恢复。
@@ -174,6 +186,11 @@ pub async fn run(root: &Path) -> io::Result<()> {
         set_sel: 0,
         set_editing: None,
         set_values: Vec::new(),
+        pending: Vec::new(),
+        appr_sel: 0,
+        appr_form: [String::new(), String::new()],
+        del_list: Vec::new(),
+        del_sel: 0,
     };
     // 启动信息（splash 下面的对话流里保留这几行供回看）
     ui.items.push(Item::Info(format!("工作区: {}", ui.workspace)));
@@ -234,6 +251,8 @@ fn handle_key(ui: &mut Ui, ev: Event, agent: &mut AgentHandle, root: &Path) {
         // splash：任意键跳过（定时器也会自动跳过）
         Mode::Splash => ui.mode = Mode::Chat,
         Mode::Settings => settings_key(ui, code, root),
+        Mode::Approve => approve_key(ui, code, root),
+        Mode::Delete => delete_key(ui, code, root),
         Mode::Chat => chat_key(ui, code, modifiers, agent, root),
     }
 }
@@ -307,9 +326,109 @@ fn settings_key(ui: &mut Ui, code: KeyCode, root: &Path) {
     }
 }
 
+/// Approve 模式的按键：表单式编辑（选中字段直接敲字），Enter 批准、Esc 拒绝
+fn approve_key(ui: &mut Ui, code: KeyCode, root: &Path) {
+    match code {
+        KeyCode::Enter => approve_current(ui, root),
+        KeyCode::Esc => reject_current(ui),
+        // 两个可编辑字段间切换（0=name 1=description；command 不可改——
+        // 审批的字符串 = 永远执行的全部内容，这是安全红线）
+        KeyCode::Up => ui.appr_sel = 0,
+        KeyCode::Down => ui.appr_sel = 1,
+        KeyCode::Tab => ui.appr_sel = 1 - ui.appr_sel,
+        KeyCode::Char(c) => ui.appr_form[ui.appr_sel].push(c),
+        KeyCode::Backspace => {
+            ui.appr_form[ui.appr_sel].pop();
+        }
+        _ => {}
+    }
+}
+
+/// 批准当前提案：改名后的表单值 + 只读 command 原样写入 .do/commands.json
+fn approve_current(ui: &mut Ui, root: &Path) {
+    let Some(p) = ui.pending.first() else {
+        ui.mode = Mode::Chat;
+        return;
+    };
+    let name = ui.appr_form[0].trim().to_string();
+    let description = ui.appr_form[1].trim().to_string();
+    // 批准前再验一次 name（人类改名也要守同一规则）
+    if !agent_core::commands::valid_name(&name) {
+        ui.items.push(Item::Info("name 只能包含字母/数字/_/-".into()));
+        return;
+    }
+    // 与内建工具或已批准命令重名 = 拒绝（覆盖已有工具太危险）
+    const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "start", "propose_command"];
+    let mut cmds = agent_core::commands::load(root);
+    if BUILTIN.contains(&name.as_str()) || cmds.iter().any(|c| c.name == name) {
+        ui.items.push(Item::Info(format!("name 冲突：{name} 已是现有工具")));
+        return;
+    }
+    cmds.push(ApprovedCommand {
+        name: name.clone(),
+        command: p.command.clone(), // command 不可改：审批什么就执行什么
+        description,
+        mode: p.mode.clone(),
+    });
+    match agent_core::commands::save(root, &cmds) {
+        Ok(()) => {
+            ui.items.push(Item::Info(format!("已批准并注册: {name}")));
+            ui.pending.remove(0);
+            next_pending_or_chat(ui);
+        }
+        Err(e) => ui.items.push(Item::Info(e.to_string())),
+    }
+}
+
+/// 拒绝当前提案：丢弃，不入盘
+fn reject_current(ui: &mut Ui) {
+    if let Some(p) = ui.pending.first() {
+        ui.items.push(Item::Info(format!("已拒绝提案: {}", p.name)));
+        ui.pending.remove(0);
+    }
+    next_pending_or_chat(ui);
+}
+
+/// 审批完一条：还有待批就装填下一条，否则回对话
+fn next_pending_or_chat(ui: &mut Ui) {
+    match ui.pending.first() {
+        Some(p) => {
+            ui.appr_form = [p.name.clone(), p.description.clone()];
+            ui.appr_sel = 0;
+        }
+        None => ui.mode = Mode::Chat,
+    }
+}
+
+/// Delete 模式的按键：↑↓ 选择、Enter 删除、Esc 返回
+fn delete_key(ui: &mut Ui, code: KeyCode, root: &Path) {
+    match code {
+        KeyCode::Up => ui.del_sel = ui.del_sel.saturating_sub(1),
+        KeyCode::Down => {
+            if !ui.del_list.is_empty() {
+                ui.del_sel = (ui.del_sel + 1).min(ui.del_list.len() - 1);
+            }
+        }
+        KeyCode::Enter => {
+            if ui.del_sel < ui.del_list.len() {
+                let gone = ui.del_list.remove(ui.del_sel);
+                match agent_core::commands::save(root, &ui.del_list) {
+                    Ok(()) => ui.items.push(Item::Info(format!("已撤销: {}", gone.name))),
+                    Err(e) => ui.items.push(Item::Info(e.to_string())),
+                }
+                ui.del_sel = ui.del_sel.min(ui.del_list.len().saturating_sub(1));
+                if ui.del_list.is_empty() {
+                    ui.mode = Mode::Chat;
+                }
+            }
+        }
+        KeyCode::Esc => ui.mode = Mode::Chat,
+        _ => {}
+    }
+}
+
 /// 设置页保存一个字段：写哪层只读写哪层（与 /setting 命令同一纪律）
-fn settings_save(ui: &mut Ui, root: &Path, value: String) {
-    let (field, global) = SETTINGS_FIELDS[ui.set_sel];
+fn settings_save(ui: &mut Ui, root: &Path, value: String) {    let (field, global) = SETTINGS_FIELDS[ui.set_sel];
     let result = if global {
         match agent_core::config::exe_dir() {
             Some(dir) => {
@@ -346,6 +465,14 @@ fn settings_save(ui: &mut Ui, root: &Path, value: String) {
 /// agent 事件处理：流式增量拼到对话流最后一条同类记录上
 fn handle_agent(ui: &mut Ui, ev: Evt) {
     match ev {
+        Evt::Proposal(p) => {
+            // 命令提案：入待批队列，对话流里给一条提示
+            ui.items.push(Item::Info(format!(
+                "命令提案: {} = `{}`（{}），/addc 审批",
+                p.name, p.command, p.mode
+            )));
+            ui.pending.push(p);
+        }
         Evt::Text(t) => {
             // 正文开始输出 → 展开中的思考块全部自动折叠。
             // 流式期间它们是实时可见的（open=true），正文一来就让位
@@ -407,6 +534,40 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
     let arg = parts.next().unwrap_or("").trim();
     match cmd {
         "quit" => ui.quit = true,
+        // /addc：有待批提案则进入审批页（表单预填提案值，可改名再批）
+        "addc" => match ui.pending.first() {
+            Some(p) => {
+                ui.appr_form = [p.name.clone(), p.description.clone()];
+                ui.appr_sel = 0;
+                ui.mode = Mode::Approve;
+            }
+            None => ui.items.push(Item::Info("无待审批提案".into())),
+        },
+        // /deletec：带名字直接删；不带则进入删除页
+        "deletec" => {
+            if arg.is_empty() {
+                let cmds = agent_core::commands::load(root);
+                if cmds.is_empty() {
+                    ui.items.push(Item::Info("无已批准命令".into()));
+                } else {
+                    ui.del_list = cmds;
+                    ui.del_sel = 0;
+                    ui.mode = Mode::Delete;
+                }
+            } else {
+                let mut cmds = agent_core::commands::load(root);
+                let before = cmds.len();
+                cmds.retain(|c| c.name != arg);
+                if cmds.len() == before {
+                    ui.items.push(Item::Info(format!("未找到已批准命令: {arg}")));
+                } else {
+                    match agent_core::commands::save(root, &cmds) {
+                        Ok(()) => ui.items.push(Item::Info(format!("已撤销: {arg}"))),
+                        Err(e) => ui.items.push(Item::Info(e.to_string())),
+                    }
+                }
+            }
+        }
         "new" => {
             // /new 即压缩：清历史，把 HANDOFF.md 作为第一条用户消息注入
             agent.send(Cmd::Reset);
@@ -521,6 +682,8 @@ fn mask_key(key: &str) -> String {
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/setting", "/setting [-g] <url|key|model|start> <值>"),
     ("/new", "/new"),
+    ("/addc", "/addc 审批命令提案"),
+    ("/deletec", "/deletec [name] 撤销已批准命令"),
     ("/quit", "/quit"),
 ];
 
@@ -592,6 +755,8 @@ fn hint_text(ui: &Ui) -> String {
         } else {
             "↑↓ 选择 · Enter 编辑 · Esc 返回".to_string()
         },
+        Mode::Approve => "↑↓/Tab 切换字段 · 直接输入编辑 · Enter 批准 · Esc 拒绝".to_string(),
+        Mode::Delete => "↑↓ 选择 · Enter 删除 · Esc 返回".to_string(),
         Mode::Chat => if ui.busy {
             "^E 展开/折叠 · Esc 取消 · ↑↓/PgUp/Dn 滚动 · ^C 退出".to_string()
         } else {
@@ -620,16 +785,18 @@ fn draw(term: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &Ui) -> io::Resul
             ])
             .split(area);
 
-        // 主区域：Chat = 对话流；Settings = 设置页
+        // 主区域：Chat = 对话流；Settings/Approve/Delete = 各自页面
         let width = chunks[0].width as usize;
         let lines = match ui.mode {
             Mode::Settings => settings_lines(ui),
+            Mode::Approve => approve_lines(ui, width),
+            Mode::Delete => delete_lines(ui),
             _ => build_lines(ui, width),
         };
         let height = chunks[0].height as usize;
         let total = lines.len();
-        // 设置页不滚动（内容一屏内），对话流正常滚动
-        let scroll = if ui.mode == Mode::Settings { 0 } else { ui.scroll };
+        // 页面类不滚动（内容一屏内），对话流正常滚动
+        let scroll = if ui.mode == Mode::Chat { ui.scroll } else { 0 };
         let bottom_skip = scroll.min(total.saturating_sub(height));
         let start = total.saturating_sub(height + bottom_skip);
         let visible: Vec<Line> = lines
@@ -645,8 +812,11 @@ fn draw(term: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &Ui) -> io::Resul
             chunks[1],
         );
 
-        // 输入行：Chat = 输入框；Settings 编辑态 = 字段编辑框
+        // 输入行：Chat = 输入框；Settings 编辑态 = 字段编辑框；审批/删除页无输入行
         match ui.mode {
+            Mode::Approve | Mode::Delete => {
+                frame.render_widget(Paragraph::new(""), chunks[2]);
+            }
             Mode::Settings => {
                 if let Some(buf) = &ui.set_editing {
                     let (field, _) = SETTINGS_FIELDS[ui.set_sel];
@@ -741,6 +911,76 @@ fn settings_lines(ui: &Ui) -> Vec<Line<'static>> {
         };
         out.push(Line::from(Span::styled(
             format!("{} {field:<6} = {shown}", if selected { ">" } else { " " }),
+            style,
+        )));
+    }
+    out
+}
+
+/// 审批页：command 全文只读展示，name/description 两行可编辑（选中行青色）
+fn approve_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let section = Style::default().fg(Color::DarkGray);
+    let Some(p) = ui.pending.first() else {
+        return out;
+    };
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        "命令提案审批（command 不可修改 —— 审批的字符串 = 永远执行的全部内容）",
+        section,
+    )));
+    out.push(Line::from(""));
+    // command 可能很长，按宽度折行完整展示
+    for l in wrap_text(&format!("command = {}", p.command), width.max(8)) {
+        out.push(Line::from(Span::styled(l, Style::default().fg(Color::Yellow))));
+    }
+    out.push(Line::from(Span::styled(format!("mode    = {}", p.mode), section)));
+    let labels = ["name", "desc"];
+    for (i, label) in labels.iter().enumerate() {
+        let selected = i == ui.appr_sel;
+        let style = if selected {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        out.push(Line::from(Span::styled(
+            format!("{} {label:<6} = {}", if selected { ">" } else { " " }, ui.appr_form[i]),
+            style,
+        )));
+    }
+    if ui.pending.len() > 1 {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            format!("（还有 {} 条待批）", ui.pending.len() - 1),
+            section,
+        )));
+    }
+    out
+}
+
+/// 删除页：已批准命令列表，选中行青色
+fn delete_lines(ui: &Ui) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        "已批准命令（Enter 删除即撤销该工具）",
+        Style::default().fg(Color::DarkGray),
+    )));
+    for (i, c) in ui.del_list.iter().enumerate() {
+        let selected = i == ui.del_sel;
+        let style = if selected {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        out.push(Line::from(Span::styled(
+            format!(
+                "{} {:<12} = `{}`（{}）",
+                if selected { ">" } else { " " },
+                c.name,
+                c.command,
+                c.mode
+            ),
             style,
         )));
     }
@@ -873,6 +1113,11 @@ mod tests {
             set_sel: 0,
             set_editing: None,
             set_values: Vec::new(),
+            pending: Vec::new(),
+            appr_sel: 0,
+            appr_form: [String::new(), String::new()],
+            del_list: Vec::new(),
+            del_sel: 0,
         }
     }
 
@@ -947,6 +1192,38 @@ mod tests {
         assert_eq!(mask_key("sk-abcdefghij"), "sk-****ghij");
         assert_eq!(mask_key("short"), "****");
         assert_eq!(mask_key(""), "****");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn addc_without_pending_shows_hint() {
+        // 无待批提案时 /addc 只提示，不进审批页
+        let dir = std::env::temp_dir().join(format!("doagent-tui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut agent = AgentHandle::start(&dir).unwrap();
+        let mut ui = test_ui();
+        slash(&mut ui, &mut agent, &dir, "addc");
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("无待审批提案")));
+        assert_eq!(ui.mode, Mode::Chat);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposal_event_queues_pending() {
+        // AI 提案事件 → 进待批队列 + 对话流提示
+        let mut ui = test_ui();
+        handle_agent(
+            &mut ui,
+            Evt::Proposal(ApprovedCommand {
+                name: "dev".into(),
+                command: "npm run dev".into(),
+                description: "开发服务器".into(),
+                mode: "daemon".into(),
+            }),
+        );
+        assert_eq!(ui.pending.len(), 1);
+        assert_eq!(ui.pending[0].name, "dev");
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("/addc")));
     }
 
     #[test]

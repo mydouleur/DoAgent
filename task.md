@@ -88,11 +88,5 @@
 
 ## 待思考调整（记录）
 
-1. ~~**TUI 的 Markdown 渲染**~~ ✅ 已完成：全量解析器 pulldown-cmark（仅 crates/do），只渲染 AI 回复主体，思考内容保持纯文本；流式中间态自然降级；+194 KB（2.56 → 2.75 MB）
-2. ~~**思考内容（reasoning）不可见**~~ ✅ 已完成：流式期间思考块实时展开（灰色），正文开始输出即自动折叠为 `思考 (+N 字)`；Ctrl+E 全局展开/折叠不变
-3. ~~**logo 位置/展示方式**~~ ✅ 已完成：改为全屏 splash——logo 居中 + 版本号 + 配置状态（key/model/工作区），任意键或 ~1.2s 自动进入对话，不强制等待
-4. ~~**/setting 独立界面**~~ ✅ 已完成：裸 `/setting` 进入设置页（全局 url/key/model + 工作区 start 两区，↑↓ 选择、Enter 编辑、Esc 返回/放弃），key 掩码 `sk-****xxxx`；带参数的单行命令形式保留
-5. ~~**工具调用显示样式**~~ ✅ 已完成：折叠态改函数调用样式 `read("src/main.rs")`、`grep("foo", "src/")`（解析失败兜底 `name()`）；展开态显示完整 args + 结果
-6. ~~**手动取消机制**~~ ✅ 已完成：Esc → `Cmd::Cancel` 置位 `Arc<AtomicBool>`（未引 tokio-util），SSE 每 chunk 与每次工具执行前检查；半截内容保留，Done 后补"（已取消）"；平时 Esc 不响应
-7. ~~**内建工具参数校验**~~ ✅ 已完成：`agent.rs` 派发前手写 required/type 检查（`check_call`），缺参/类型错/非法 JSON 不执行工具、错误文案作为 tool 结果回填模型自愈，静默降级 `{}` 已移除
-8. **固定命令白名单 `/addc` `/deletec`（替代/扩展 start，触及"不碰 shell"理念，需先拍板）**：AI 可提案注册**固定命令**（如 `npm run dev`，零参数、不开参数面），人类审批后才生效；批准列表落盘 `.do/commands.json`（对 AI 隐形规则同 `.do/` 其余文件），即为 AI 可执行 shell 能力的完整边界。设计要点：①审批覆盖的字符串 = 永远执行的全部内容，零注入面；②长跑命令（dev server 类）走 start 的后台语义，add 时需声明一次性/常驻二态；③提案须含合法工具名（`^[a-zA-Z0-9_-]+$`）和 description，审批界面允许人类改名再批；④持久批准、`/deletec` 撤销，不做逐次审批（防审批疲劳）；⑤固定 cwd 为工作区根。前置依赖：先做 6、7，再给 AI 开放命令提案
+**1-7 已完成并清理**（v0.2 批次）：①Assistant 正文 Markdown 全量渲染（pulldown-cmark，仅 do crate，+194 KB）；②思考流式可见、正文开始自动折叠；③启动 splash（任意键/1.2s 跳过）；④/setting 独立设置页（key 掩码）；⑤工具调用函数样式 `read("src/main.rs")`；⑥Esc 取消（Arc<AtomicBool>，零新依赖）；⑦工具参数派发前校验、错误回填模型自愈。批次终态：38 测试全绿、clippy 零警告、do.exe 2.76 MB。
+8. ~~**固定命令白名单 `/addc` `/deletec`**~~ ✅ 已完成：AI 用内建工具 `propose_command` 提案（name 限 `^[a-zA-Z0-9_-]+$`、mode 二态，校验失败回填模型）；`/addc` 审批页 command 只读、name/description 可改名再批；批准落盘 `.do/commands.json`（对 AI 隐形）即成为零参数动态工具；`/deletec` 页面或带名直删。执行路径与 start 统一为 shell 包装（Windows `cmd /c` / Unix `sh -c`，修掉 npm.cmd 找不到的问题；审批常量零拼接故无注入面），cwd 固定工作区根，once 返回输出尾 20KB、daemon 后台 spawn 立即返回

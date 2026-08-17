@@ -35,7 +35,7 @@ It helps you write code. **Control stays with you.**
 - **Runs anywhere**: servers, Docker, edge devices — `scp` it over and it works
 - **Truly portable**: the program and its config live in one folder; uninstall = delete the folder, zero residue
 
-## Only 6 tools
+## Only 6 built-in tools
 
 | Tool | What it does |
 |---|---|
@@ -43,7 +43,9 @@ It helps you write code. **Control stays with you.**
 | `ls` / `grep` | list directories, search content |
 | `start` | runs the **one command you configured** (build / typecheck) and feeds the output back to the AI |
 
-No bash. The AI's only channel for compiler feedback is `start` — you pick the command, it can only press the button.
+No free-form shell. The AI's main channel for compiler feedback is `start` — you pick the command, it can only press the button.
+
+**Command whitelist**: the AI can *propose* fixed commands (`propose_command`, e.g. `npm run dev`), but nothing executes until you approve them with `/addc`. Approved commands live in `.do/commands.json` and become zero-argument tools the AI may call — the approved string is all that ever runs, no parameters, always in the workspace root. `/deletec` revokes.
 
 ## Safety: the workspace is the boundary
 
