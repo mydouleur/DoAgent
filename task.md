@@ -99,3 +99,6 @@ tools 数组永远冻结为这 7 个：prompt 缓存按 system + tools + message
 1. **/setting 页面还有 bug**（现象待补录）
 2. **start 清理不完全**：弃用 start 独立工具后仍有残留引用/语义待排查（文档、提示文案、隐式条目边界）
 3. **splash 页美化 + 展示时长调整**（排版打磨；1.2s 自动跳过的时长再斟酌）
+4. **TLS 平台分叉（已拍板方向，待实施）**：仅 musl 版保留 rustls 静态链接（通用兜底，任何 Linux 可跑），Windows（Schannel）/ macOS（Security.framework）/ Linux-gnu（系统 OpenSSL）改用 `native-tls`。reqwest 已抽象 TLS 栈，业务代码零改动，只是 Cargo 按 target 条件分 feature（`cfg(all(target_os="linux", target_env="musl"))` 分区）。预期：win/mac ~1.8 MB、gnu ~2.1 MB、musl 仍 3.2 MB（体积倒挂合理：通用性用体积买）。注意：①gnu 版变成 OpenSSL 3 系发行版专用，README 需写明"musl = 通用版"；②Cargo.lock 会锁两套 TLS 依赖；③**本地无法验证 HTTPS 握手**（网络原因），CI 必须加一步对已发布二进制请求可达 HTTPS 端点（如 github.com）的冒烟
+5. **CI 矩阵加 macOS**：`macos-latest`（aarch64）+ 可选 `macos-13`（x86_64 Intel）；ring 直接编译无需额外工具链；README 补一行 Gatekeeper 说明（`xattr -d com.apple.quarantine do`）；v0.2.0 发版时顺手做
+6. **代码清理**：tui.rs 近千行可按页面拆模块；try.cmd 注释改英文（cmd.exe 不认 UTF-8 无 BOM，中文注释会被当命令执行）
