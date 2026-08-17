@@ -76,7 +76,8 @@ Then just talk: "check the error in src/main.rs".
 |---|---|
 | `/setting [-g] <url\|key\|model\|start> <value>` | change config (`-g` writes the global layer) |
 | `/new` | new conversation (auto-resumes from HANDOFF.md) |
-| `/addcmd` / `/deletecmd [name]` | approve / revoke whitelisted commands |
+| `/addcmd <name 命令>` | self-register a whitelisted command (confirms in the approval page) |
+| `/allowcmd` / `/deletecmd [name]` | approve AI proposals / revoke whitelisted commands |
 | `/quit` or `Ctrl+C` | exit |
 | `Ctrl+E` | expand/collapse thinking & tool calls |
 | `PageUp / PageDown` | scroll history |

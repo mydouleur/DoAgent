@@ -78,7 +78,8 @@ do
 |---|---|
 | `/setting [-g] <url\|key\|model\|start> <值>` | 改配置（带 `-g` 写全局） |
 | `/new` | 新对话（自动接续 HANDOFF.md 交接文档） |
-| `/addcmd` / `/deletecmd [name]` | 审批 / 撤销白名单命令 |
+| `/addcmd <name 命令>` | 自助注册白名单命令（仍过审批页确认） |
+| `/allowcmd` / `/deletecmd [name]` | 审批 AI 提案 / 撤销白名单命令 |
 | `/quit` 或 `Ctrl+C` | 退出 |
 | `Ctrl+E` | 展开/折叠思考过程与工具调用 |
 | `PageUp / PageDown` | 滚动历史 |
