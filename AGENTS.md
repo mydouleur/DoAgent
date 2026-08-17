@@ -14,7 +14,7 @@ cargo clippy --all-targets  # 必须零警告
 
 ## 结构
 
-- `crates/core`（lib）：workspace（工作区守卫）/ tools（6 工具）/ api（SSE）/ agent（loop）/ config（双层配置）
+- `crates/core`（lib）：workspace（工作区守卫）/ tools（7 工具）/ api（SSE）/ agent（loop）/ config（双层配置）/ commands（命令白名单）
 - `crates/do`（bin）：main + tui（ratatui），只通过 core 的最小公共 API 交互
 
 ## 硬性约定

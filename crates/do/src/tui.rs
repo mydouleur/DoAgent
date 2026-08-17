@@ -62,9 +62,9 @@ enum Mode {
     Chat,
     /// /setting 独立设置页
     Settings,
-    /// /addc 命令提案审批页（command 只读，name/description 可改名再批）
+    /// /addcmd 命令提案审批页（command 只读，name/description 可改名再批）
     Approve,
-    /// /deletec 已批准命令删除页
+    /// /deletecmd 已批准命令删除页
     Delete,
 }
 
@@ -118,7 +118,7 @@ struct Ui {
     set_editing: Option<String>,
     /// 设置页：进入时载入的各字段当前值（key 存真值，显示时才掩码）
     set_values: Vec<String>,
-    /// 待审批的命令提案队列（AI 通过 propose_command 提交，内存态不落盘）
+    /// 待审批的命令提案队列（AI 通过 addcmd 提交，内存态不落盘）
     pending: Vec<ApprovedCommand>,
     /// 审批页：当前编辑字段（0=name 1=description）与表单值
     appr_sel: usize,
@@ -251,7 +251,7 @@ fn handle_key(ui: &mut Ui, ev: Event, agent: &mut AgentHandle, root: &Path) {
         // splash：任意键跳过（定时器也会自动跳过）
         Mode::Splash => ui.mode = Mode::Chat,
         Mode::Settings => settings_key(ui, code, root),
-        Mode::Approve => approve_key(ui, code, root),
+        Mode::Approve => approve_key(ui, code, agent, root),
         Mode::Delete => delete_key(ui, code, root),
         Mode::Chat => chat_key(ui, code, modifiers, agent, root),
     }
@@ -327,9 +327,9 @@ fn settings_key(ui: &mut Ui, code: KeyCode, root: &Path) {
 }
 
 /// Approve 模式的按键：表单式编辑（选中字段直接敲字），Enter 批准、Esc 拒绝
-fn approve_key(ui: &mut Ui, code: KeyCode, root: &Path) {
+fn approve_key(ui: &mut Ui, code: KeyCode, agent: &mut AgentHandle, root: &Path) {
     match code {
-        KeyCode::Enter => approve_current(ui, root),
+        KeyCode::Enter => approve_current(ui, agent, root),
         KeyCode::Esc => reject_current(ui),
         // 两个可编辑字段间切换（0=name 1=description；command 不可改——
         // 审批的字符串 = 永远执行的全部内容，这是安全红线）
@@ -345,7 +345,7 @@ fn approve_key(ui: &mut Ui, code: KeyCode, root: &Path) {
 }
 
 /// 批准当前提案：改名后的表单值 + 只读 command 原样写入 .do/commands.json
-fn approve_current(ui: &mut Ui, root: &Path) {
+fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
     let Some(p) = ui.pending.first() else {
         ui.mode = Mode::Chat;
         return;
@@ -357,11 +357,12 @@ fn approve_current(ui: &mut Ui, root: &Path) {
         ui.items.push(Item::Info("name 只能包含字母/数字/_/-".into()));
         return;
     }
-    // 与内建工具或已批准命令重名 = 拒绝（覆盖已有工具太危险）
-    const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "start", "propose_command"];
+    // 与内建工具或已批准命令重名 = 拒绝（覆盖已有工具太危险）。
+    // start 是隐式保留名（白名单视图会合并 config.start），一并保护
+    const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "addcmd", "runcmd", "start"];
     let mut cmds = agent_core::commands::load(root);
     if BUILTIN.contains(&name.as_str()) || cmds.iter().any(|c| c.name == name) {
-        ui.items.push(Item::Info(format!("name 冲突：{name} 已是现有工具")));
+        ui.items.push(Item::Info(format!("name 冲突：{name} 已被占用")));
         return;
     }
     cmds.push(ApprovedCommand {
@@ -374,6 +375,13 @@ fn approve_current(ui: &mut Ui, root: &Path) {
         Ok(()) => {
             ui.items.push(Item::Info(format!("已批准并注册: {name}")));
             ui.pending.remove(0);
+            // 批准后通知模型：以 user 角色注入历史（不触发 API）。
+            // tools 数组是冻结的，批准不改变 prompt 前缀——零缓存代价
+            if ui.has_key {
+                agent.send(Cmd::Notify(format!(
+                    "（系统提示：命令 {name} 已获批准，可用 runcmd 调用）"
+                )));
+            }
             next_pending_or_chat(ui);
         }
         Err(e) => ui.items.push(Item::Info(e.to_string())),
@@ -468,7 +476,7 @@ fn handle_agent(ui: &mut Ui, ev: Evt) {
         Evt::Proposal(p) => {
             // 命令提案：入待批队列，对话流里给一条提示
             ui.items.push(Item::Info(format!(
-                "命令提案: {} = `{}`（{}），/addc 审批",
+                "命令提案: {} = `{}`（{}），/addcmd 审批",
                 p.name, p.command, p.mode
             )));
             ui.pending.push(p);
@@ -534,8 +542,8 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
     let arg = parts.next().unwrap_or("").trim();
     match cmd {
         "quit" => ui.quit = true,
-        // /addc：有待批提案则进入审批页（表单预填提案值，可改名再批）
-        "addc" => match ui.pending.first() {
+        // /addcmd：有待批提案则进入审批页（表单预填提案值，可改名再批）
+        "addcmd" => match ui.pending.first() {
             Some(p) => {
                 ui.appr_form = [p.name.clone(), p.description.clone()];
                 ui.appr_sel = 0;
@@ -543,8 +551,8 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
             }
             None => ui.items.push(Item::Info("无待审批提案".into())),
         },
-        // /deletec：带名字直接删；不带则进入删除页
-        "deletec" => {
+        // /deletecmd：带名字直接删；不带则进入删除页
+        "deletecmd" => {
             if arg.is_empty() {
                 let cmds = agent_core::commands::load(root);
                 if cmds.is_empty() {
@@ -634,7 +642,11 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                 Err(e) => ui.items.push(Item::Info(e)),
             }
         }
-        _ => ui.items.push(Item::Info("未知命令（/setting /new /quit）".into())),
+        // 旧名 /addcmd /deletecmd 不做别名，直接落入未知命令提示——
+        // 提示里列出新名，即一行迁移指引
+        _ => ui.items.push(Item::Info(
+            "未知命令（/setting /new /addcmd /deletecmd /quit）".into(),
+        )),
     }
 }
 
@@ -682,8 +694,8 @@ fn mask_key(key: &str) -> String {
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/setting", "/setting [-g] <url|key|model|start> <值>"),
     ("/new", "/new"),
-    ("/addc", "/addc 审批命令提案"),
-    ("/deletec", "/deletec [name] 撤销已批准命令"),
+    ("/addcmd", "/addcmd 审批命令提案"),
+    ("/deletecmd", "/deletecmd [name] 撤销已批准命令"),
     ("/quit", "/quit"),
 ];
 
@@ -735,6 +747,11 @@ fn format_call(name: &str, args_json: &str) -> String {
         "ls" => match arg("path") {
             Some(p) => format!("ls({p})"),
             None => "ls()".to_string(),
+        },
+        // 命令白名单工具：主参数是 name，如 runcmd("deploy")、addcmd("dev")
+        "addcmd" | "runcmd" => match arg("name") {
+            Some(n) => format!("{name}({n})"),
+            None => format!("{name}()"),
         },
         _ => format!("{name}()"),
     }
@@ -1195,16 +1212,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn addc_without_pending_shows_hint() {
-        // 无待批提案时 /addc 只提示，不进审批页
+    async fn addcmd_slash_behaviour() {
         let dir = std::env::temp_dir().join(format!("doagent-tui-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut agent = AgentHandle::start(&dir).unwrap();
         let mut ui = test_ui();
-        slash(&mut ui, &mut agent, &dir, "addc");
+        // 无待批提案时 /addcmd 只提示，不进审批页
+        slash(&mut ui, &mut agent, &dir, "addcmd");
         assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("无待审批提案")));
         assert_eq!(ui.mode, Mode::Chat);
+        // 旧名 /addcmd /deletecmdmd 不再识别，提示里列出新名（迁移指引）
+        slash(&mut ui, &mut agent, &dir, "addc");
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("未知命令") && t.contains("/addcmd")));
+        slash(&mut ui, &mut agent, &dir, "deletec");
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("未知命令") && t.contains("/deletecmd")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1223,7 +1245,7 @@ mod tests {
         );
         assert_eq!(ui.pending.len(), 1);
         assert_eq!(ui.pending[0].name, "dev");
-        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("/addc")));
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("/addcmd")));
     }
 
     #[test]

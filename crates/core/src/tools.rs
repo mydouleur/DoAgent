@@ -90,14 +90,9 @@ pub fn defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "start".into(),
-            description: "执行配置的启动/构建命令（/setting start 设置），返回输出尾部".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDef {
             // 命令白名单的入口：AI 只提案，人类在 TUI 审批后才生效
-            name: "propose_command".into(),
-            description: "提案一条固定命令，人类批准后成为可调用工具".into(),
+            name: "addcmd".into(),
+            description: "提案一条固定命令，人类批准后可用 runcmd 调用".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -109,19 +104,19 @@ pub fn defs() -> Vec<ToolDef> {
                 "required": ["name", "command", "description", "mode"]
             }),
         },
+        ToolDef {
+            // 发现式调用：白名单内容不进 tools 数组（见 agent.rs 缓存论点注释），
+            // AI 用 runcmd 无参列出白名单，带 name 执行
+            name: "runcmd".into(),
+            description: "列出或执行已批准的固定命令（不带 name 列出全部）".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "命令名,省略则列出白名单" }
+                }
+            }),
+        },
     ]
-}
-
-/// 把批准的固定命令转成动态工具定义：零参数 schema。
-/// AI 看到的就是一个无参函数，调它 = 按审批的字符串原样执行。
-pub fn command_defs(cmds: &[ApprovedCommand]) -> Vec<ToolDef> {
-    cmds.iter()
-        .map(|c| ToolDef {
-            name: Cow::Owned(c.name.clone()),
-            description: Cow::Owned(c.description.clone()),
-            parameters: json!({ "type": "object", "properties": {} }),
-        })
-        .collect()
 }
 
 /// 执行工具。返回给模型的永远是字符串：成功是结果，失败是错误文案。
@@ -134,15 +129,11 @@ pub async fn run(ws: &Workspace, name: &str, args: &Value) -> String {
         "edit" => tool_edit(ws, args),
         "ls" => tool_ls(ws, args),
         "grep" => tool_grep(ws, args),
-        "start" => tool_start(ws).await,
-        // propose_command 正常由 agent 拦截（要发审批事件）；
+        "runcmd" => tool_runcmd(ws, args).await,
+        // addcmd 正常由 agent 拦截（要发审批事件）；
         // 走到这里说明漏拦，至少别把提案弄丢
-        "propose_command" => "已提交人类审批，结果待人工确认".to_string(),
-        // 内建之外的名字：查命令白名单，命中则按固定字符串执行
-        other => match crate::commands::load(ws.root()).into_iter().find(|c| c.name == other) {
-            Some(c) => run_approved(ws, &c).await,
-            None => format!("未知工具: {other}"),
-        },
+        "addcmd" => "已提交人类审批，结果待人工确认".to_string(),
+        other => format!("未知工具: {other}"),
     }
 }
 
@@ -328,15 +319,51 @@ fn tool_grep(ws: &Workspace, args: &Value) -> String {
     }
 }
 
-/// start：执行 `.do/config.json` 里的那一条命令。
+/// runcmd：发现式调用——不带 name 列出白名单，带 name 现读现执行。
 /// 不走 workspace 守卫——`.do` 对 AI 隐形，但工具自己人可读。
-async fn tool_start(ws: &Workspace) -> String {
-    // start 只属于工作区层，无需合并全局层
-    let cfg = Config::load_workspace(ws.root());
-    if cfg.start.is_empty() {
-        return "未设置启动命令，请让使用者用 /setting start <命令> 设置".to_string();
+async fn tool_runcmd(ws: &Workspace, args: &Value) -> String {
+    let list = whitelist(ws);
+    match args.get("name").and_then(|v| v.as_str()) {
+        // 无参：格式化列出全部（name、命令全文、mode、description）
+        None => {
+            if list.is_empty() {
+                return "当前无已批准命令，可用 addcmd 提案".to_string();
+            }
+            list.iter()
+                .map(|c| format!("{} = `{}`（{}）{}", c.name, c.command, c.mode, c.description))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        Some(n) => match list.iter().find(|c| c.name == n) {
+            Some(c) => run_approved(ws, c).await,
+            // 自愈原则：错误信息附上当前白名单，模型看到可自我纠正
+            None => {
+                let names = if list.is_empty() {
+                    "（空）".to_string()
+                } else {
+                    list.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                };
+                format!("未知命令 {n}，当前已批准：{names}")
+            }
+        },
     }
-    run_once(ws, &cfg.start).await
+}
+
+/// 白名单视图 = `.do/commands.json` + 隐式 start 条目。
+/// start 弃用独立工具后，`/setting start` 配的那条命令并入这里
+/// （只读视图层合并，不落盘 commands.json；白名单里已有 start 则不重复）
+fn whitelist(ws: &Workspace) -> Vec<ApprovedCommand> {
+    let mut cmds = crate::commands::load(ws.root());
+    let start = Config::load_workspace(ws.root()).start;
+    if !start.is_empty() && !cmds.iter().any(|c| c.name == "start") {
+        cmds.push(ApprovedCommand {
+            name: "start".into(),
+            command: start,
+            description: "配置的启动/构建命令（/setting start 设置）".into(),
+            mode: "once".into(),
+        });
+    }
+    cmds
 }
 
 /// 执行批准的固定命令：once 等结束返回输出尾部；daemon 后台 spawn 立即返回。
@@ -523,42 +550,71 @@ mod tests {
     }
 
     #[test]
-    fn command_defs_are_zero_arg_tools() {
-        // 批准的命令出现在 tool schema 里：名字 + 描述 + 零参数
-        let defs = command_defs(&sample_cmds());
-        assert_eq!(defs.len(), 2);
-        assert_eq!(defs[0].name, "hello");
-        assert_eq!(defs[0].description, "测试用一次性命令");
-        assert!(defs[0].parameters["properties"].as_object().unwrap().is_empty());
+    fn defs_frozen_at_seven() {
+        // tools 数组冻结：恰为 7 个固定内建工具，
+        // 白名单内容不进入 defs（缓存论点见 agent.rs）
+        // as_ref 借的是临时 Vec，先绑定再取（临时值生命周期 ≈ C# 里
+        // 对方法返回值直接取引用会被编译器拦住——Rust 强制先落变量）
+        let defs = defs();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            ["read", "write", "edit", "ls", "grep", "addcmd", "runcmd"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn approved_command_executes() {
+    async fn runcmd_lists_whitelist() {
         let (ws, dir) = temp_ws("c1");
+        // 空名单提示
+        let out = run(&ws, "runcmd", &json!({})).await;
+        assert!(out.contains("当前无已批准命令"), "{out}");
+        // 落盘后列出：name/命令全文/mode 都在
         crate::commands::save(&dir, &sample_cmds()).unwrap();
-        // once：真实执行，输出原样返回
-        let out = run(&ws, "hello", &json!({})).await;
-        assert!(out.contains("hello-from-cmd"), "{out}");
-        assert!(out.contains("exit code: 0"), "{out}");
-        // daemon：立即返回"已后台启动"，不等待
-        let out = run(&ws, "srv", &json!({})).await;
-        assert!(out.contains("已后台启动"), "{out}");
-        // 白名单外的名字仍是未知工具
-        let out = run(&ws, "nosuch", &json!({})).await;
-        assert!(out.contains("未知工具"));
+        let out = run(&ws, "runcmd", &json!({})).await;
+        assert!(out.contains("hello = `echo hello-from-cmd`（once）"), "{out}");
+        assert!(out.contains("srv"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn deleted_command_disappears() {
+    async fn runcmd_executes_and_reports_unknown() {
         let (ws, dir) = temp_ws("c2");
         crate::commands::save(&dir, &sample_cmds()).unwrap();
-        // 模拟 /deletec：移除后工具立即不可用（run 每次现读名单）
+        // once：真实执行，输出原样返回
+        let out = run(&ws, "runcmd", &json!({"name": "hello"})).await;
+        assert!(out.contains("hello-from-cmd"), "{out}");
+        assert!(out.contains("exit code: 0"), "{out}");
+        // daemon：立即返回"已后台启动"，不等待
+        let out = run(&ws, "runcmd", &json!({"name": "srv"})).await;
+        assert!(out.contains("已后台启动"), "{out}");
+        // 未知 name：错误附当前白名单（自愈）
+        let out = run(&ws, "runcmd", &json!({"name": "nosuch"})).await;
+        assert!(out.contains("未知命令 nosuch"), "{out}");
+        assert!(out.contains("hello") && out.contains("srv"), "{out}");
+        // 移除后工具立即消失（每次现读名单）
         let mut cmds = crate::commands::load(&dir);
         cmds.retain(|c| c.name != "hello");
         crate::commands::save(&dir, &cmds).unwrap();
-        let out = run(&ws, "hello", &json!({})).await;
-        assert!(out.contains("未知工具"), "{out}");
+        let out = run(&ws, "runcmd", &json!({"name": "hello"})).await;
+        assert!(out.contains("未知命令 hello"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn implicit_start_entry() {
+        let (ws, dir) = temp_ws("c3");
+        // config.start 为空：列表里没有 start
+        let out = run(&ws, "runcmd", &json!({})).await;
+        assert!(!out.contains("start"), "{out}");
+        // 配上 start：成为隐式条目（once），且可通过 runcmd 执行
+        let mut cfg = Config::default();
+        cfg.set("start", "echo implicit-start").unwrap();
+        cfg.save(&dir).unwrap();
+        let out = run(&ws, "runcmd", &json!({})).await;
+        assert!(out.contains("start = `echo implicit-start`（once）"), "{out}");
+        let out = run(&ws, "runcmd", &json!({"name": "start"})).await;
+        assert!(out.contains("implicit-start"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

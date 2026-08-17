@@ -37,17 +37,17 @@ DoAgent 做减法——它只有 6 个工具，不碰 shell，不碰 git，不�
 - **随处可用**：服务器、Docker、边缘设备——`scp` 上去就能跑
 - **绿色便携**：程序和配置同住一个文件夹，卸载 = 删文件夹，零残留
 
-## 它只有 6 个内建工具
+## 它只有 7 个内建工具
 
 | 工具 | 干什么 |
 |---|---|
 | `read` / `write` / `edit` | 读写改文件 |
 | `ls` / `grep` | 看目录、搜内容 |
-| `start` | 执行**你配置的**那一条命令（构建 / 类型检查），把结果喂给 AI |
+| `addcmd` / `runcmd` | 提案 / 列出并执行白名单命令（见下） |
 
-没有自由 shell。AI 拿编译反馈的主要途径是 `start`——命令由你定，它只能按。
+没有自由 shell。
 
-**命令白名单**：AI 可以用 `propose_command` **提案**固定命令（如 `npm run dev`），但批准前什么都不执行；你用 `/addc` 审批后，命令落盘 `.do/commands.json` 并成为 AI 可调用的零参数工具——审批的字符串就是永远执行的全部内容，无参数面，cwd 固定在工作区根。`/deletec` 撤销。
+**命令白名单**：AI 可以用 `addcmd` **提案**固定命令（如 `npm run dev`），但批准前什么都不执行；你用 `/addcmd` 审批后，命令落盘 `.do/commands.json`，AI 通过 `runcmd` 工具发现和调用（`runcmd()` 列出、`runcmd("name")` 执行）——审批的字符串就是永远执行的全部内容，无参数面，cwd 固定在工作区根。你配置的 `start` 命令会作为隐式条目出现在白名单里。`/deletecmd` 撤销。
 
 ## 安全设计：工作区即边界
 
@@ -78,6 +78,7 @@ do
 |---|---|
 | `/setting [-g] <url\|key\|model\|start> <值>` | 改配置（带 `-g` 写全局） |
 | `/new` | 新对话（自动接续 HANDOFF.md 交接文档） |
+| `/addcmd` / `/deletecmd [name]` | 审批 / 撤销白名单命令 |
 | `/quit` 或 `Ctrl+C` | 退出 |
 | `Ctrl+E` | 展开/折叠思考过程与工具调用 |
 | `PageUp / PageDown` | 滚动历史 |

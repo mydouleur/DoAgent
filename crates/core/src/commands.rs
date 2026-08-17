@@ -1,7 +1,7 @@
 //! 固定命令白名单：`.do/commands.json` 的读写与 name 校验
 //!
 //! # 模块导读
-//! AI 的 shell 能力边界就这一张表：AI 通过 `propose_command` 工具**提案**
+//! AI 的 shell 能力边界就这一张表：AI 通过 `addcmd` 工具**提案**
 //! 固定命令（name + command + description + mode），人类在 TUI 里审批
 //! （可改名再批）后才落盘到 `.do/commands.json`，此后该命令作为**零参数
 //! 动态工具**出现在 tool schema 里，AI 调用时按审批的固定字符串执行。

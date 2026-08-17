@@ -34,7 +34,7 @@ pub use crate::api::ToolCall;
 
 /// system prompt：控制在 200 token 内（约 300 字内）。
 /// 一句话角色 + 工具纪律 + 维护 HANDOFF.md 的义务。
-pub const SYSTEM_PROMPT: &str = "你是 DoAgent，嵌入式编程副驾驶。用内建工具(read/write/edit/ls/grep/start)读写代码，另有人类批准的固定命令工具可直接调用；无自由 shell，需要新命令用 propose_command 提案。改完代码用 start 拿编译反馈。随时在工作区根维护 HANDOFF.md（当前目标/进展/关键决策/下一步），有进展就更新。回答简洁，直接行动。";
+pub const SYSTEM_PROMPT: &str = "你是 DoAgent，嵌入式编程副驾驶。用内建工具(read/write/edit/ls/grep)读写代码；已批准的固定命令用 runcmd 列出与执行，需要新命令用 addcmd 提案（人类批准后生效）；无自由 shell。改完代码用 runcmd 跑构建命令拿反馈。随时在工作区根维护 HANDOFF.md（当前目标/进展/关键决策/下一步），有进展就更新。回答简洁，直接行动。";
 
 /// TUI 发给 agent 的命令
 pub enum Cmd {
@@ -45,6 +45,9 @@ pub enum Cmd {
     /// Esc：中断当前轮。不走消息队列（actor 正忙时读不到队列），
     /// 而是直接置位共享的取消标志（见 AgentHandle.cancel）
     Cancel,
+    /// 系统通知：以 user 角色注入消息历史（不触发 API 调用）。
+    /// 用途：/addcmd 批准后立刻让模型知道新命令可用
+    Notify(String),
 }
 
 /// agent 推给 TUI 的事件
@@ -59,7 +62,7 @@ pub enum Evt {
         args: String,
         result: String,
     },
-    /// AI 提交了一条命令提案（propose_command），等待人类 /addc 审批
+    /// AI 提交了一条命令提案（addcmd），等待人类 /addcmd 审批
     Proposal(ApprovedCommand),
     /// 本轮对话结束
     Done,
@@ -132,6 +135,7 @@ async fn actor_loop(
     evt: mpsc::UnboundedSender<Evt>,
     cancel: Arc<AtomicBool>,
 ) {
+    let defs = tools::defs();
     let mut messages: Vec<Value> = vec![json!({
         "role": "system",
         "content": SYSTEM_PROMPT,
@@ -147,7 +151,11 @@ async fn actor_loop(
                 // 新一轮开始前清掉上一轮可能残留的取消标志
                 cancel.store(false, Ordering::Relaxed);
                 messages.push(json!({"role": "user", "content": text}));
-                chat_round(&ws, &mut messages, &evt, &cancel).await;
+                chat_round(&ws, &defs, &mut messages, &evt, &cancel).await;
+            }
+            // 系统通知（如"命令已获批准"）：以 user 角色注入历史，不触发 API
+            Cmd::Notify(text) => {
+                messages.push(json!({"role": "user", "content": text}));
             }
             // Cancel 在 send 里已直接置位，队列里不会收到；穷尽匹配所需
             Cmd::Cancel => {}
@@ -156,23 +164,26 @@ async fn actor_loop(
 }
 
 /// 一轮完整对话：可能包含多次 API 调用（工具往返）。
+///
+/// # 缓存论点（为什么 tools 数组冻结为固定 7 个）
+/// prompt 缓存按请求**前缀**匹配，前缀顺序是 system + tools + messages。
+/// 若把批准的命令动态注入 tools，/addcmd 每批准一条前缀就变一次，
+/// 之前攒下的缓存全部击穿。冻结 tools 后批准动作零缓存代价；
+/// 白名单内容走 messages（runcmd 的工具结果）——messages 本来就逐轮
+/// 增长，不造成额外 miss。
 async fn chat_round(
     ws: &Workspace,
+    defs: &[tools::ToolDef],
     messages: &mut Vec<Value>,
     evt: &mpsc::UnboundedSender<Evt>,
     cancel: &AtomicBool,
 ) {
     // 工具往返设上限，防模型死循环
     for _ in 0..16 {
-        // 每轮重读批准列表并重建 tool schema：
-        // /addc 批准的新命令下一轮就对 AI 可见
-        let approved = commands::load(ws.root());
-        let mut defs = tools::defs();
-        defs.extend(tools::command_defs(&approved));
         // 生效配置 = 工作区层 > 全局便携层 > 默认；current_exe 失败自动降级
         let cfg = Config::load_merged(ws.root(), crate::config::exe_dir().as_deref());
         // 回调把流式增量就地转成事件推给 TUI
-        let reply = api::chat(&cfg, messages, &defs, cancel, |d| {
+        let reply = api::chat(&cfg, messages, defs, cancel, |d| {
             let _ = match d {
                 api::Delta::Text(t) => evt.send(Evt::Text(t)),
                 api::Delta::Reasoning(r) => evt.send(Evt::Reasoning(r)),
@@ -211,12 +222,12 @@ async fn chat_round(
             let result = if cancel.load(Ordering::Relaxed) {
                 "（已取消）".to_string()
             } else {
-                match check_call(&tc.name, &tc.arguments, &approved) {
+                match check_call(&tc.name, &tc.arguments) {
                     // 参数校验失败：不执行工具，把明确错误回填给模型
                     // （自愈原则：模型知道自己错在哪，下一轮会修正）
                     Err(e) => e,
                     Ok(args) => {
-                        if tc.name == "propose_command" {
+                        if tc.name == "addcmd" {
                             // 提案不执行任何东西：推给 TUI 等人类审批
                             let p = ApprovedCommand {
                                 name: args["name"].as_str().unwrap_or_default().to_string(),
@@ -254,14 +265,9 @@ async fn chat_round(
 }
 
 /// 派发前校验：解析 arguments + 按各工具的必填/类型规则检查。
-/// 内建工具的 schema 很简单，手写检查即可，不引 JSON Schema 库。
-/// 批准的固定命令（零参数）凭名字在白名单里即放行。
+/// 7 个内建工具的 schema 很简单，手写检查即可，不引 JSON Schema 库。
 /// 返回 Ok(解析后的参数) 或 Err(给模型看的错误文案)。
-fn check_call(
-    name: &str,
-    raw_args: &str,
-    approved: &[ApprovedCommand],
-) -> Result<Value, String> {
+fn check_call(name: &str, raw_args: &str) -> Result<Value, String> {
     let args: Value = serde_json::from_str(raw_args)
         .map_err(|_| "参数校验失败：arguments 不是合法 JSON".to_string())?;
     // 必填 string 字段检查
@@ -295,13 +301,12 @@ fn check_call(
             need("pattern")?;
             opt("path")?;
         }
-        "start" => {}
-        "propose_command" => {
+        "addcmd" => {
             need("name")?;
             need("command")?;
             need("description")?;
             need("mode")?;
-            // name 是未来的工具名，字符集硬限制（规格红线之一）
+            // name 是未来的命令名，字符集硬限制（规格红线之一）
             let n = args["name"].as_str().unwrap_or_default();
             if !commands::valid_name(n) {
                 return Err("参数校验失败：name 只能包含字母/数字/_/-".to_string());
@@ -311,8 +316,7 @@ fn check_call(
                 _ => return Err("参数校验失败：mode 只能是 once 或 daemon".to_string()),
             }
         }
-        // 批准的固定命令：零参数，名字在白名单里即放行
-        other if approved.iter().any(|c| c.name == other) => {}
+        "runcmd" => opt("name")?,
         other => return Err(format!("未知工具 {other}")),
     }
     Ok(args)
@@ -354,50 +358,45 @@ mod tests {
 
     #[test]
     fn check_call_validation() {
-        let no: &[ApprovedCommand] = &[]; // 空白名单
         // 缺必填参数 → 明确错误（回填给模型自愈）
-        let e = check_call("read", "{}", no).unwrap_err();
+        let e = check_call("read", "{}").unwrap_err();
         assert!(e.contains("缺少必填参数 path"), "{e}");
         // 类型错
-        let e = check_call("read", "{\"path\":1}", no).unwrap_err();
+        let e = check_call("read", "{\"path\":1}").unwrap_err();
         assert!(e.contains("应为 string"), "{e}");
         // 非法 JSON（旧的静默降级为 {} 已移除）
-        let e = check_call("read", "{oops", no).unwrap_err();
+        let e = check_call("read", "{oops").unwrap_err();
         assert!(e.contains("不是合法 JSON"), "{e}");
         // 正常参数不受影响
-        assert!(check_call("read", "{\"path\":\"a.rs\"}", no).is_ok());
+        assert!(check_call("read", "{\"path\":\"a.rs\"}").is_ok());
         // grep：pattern 必填、path 可选
-        assert!(check_call("grep", "{\"pattern\":\"x\"}", no).is_ok());
-        assert!(check_call("grep", "{}", no).is_err());
-        assert!(check_call("grep", "{\"pattern\":\"x\",\"path\":2}", no).is_err());
-        // start 无参；未知工具直接拒绝
-        assert!(check_call("start", "{}", no).is_ok());
-        assert!(check_call("bogus", "{}", no).unwrap_err().contains("未知工具"));
+        assert!(check_call("grep", "{\"pattern\":\"x\"}").is_ok());
+        assert!(check_call("grep", "{}").is_err());
+        assert!(check_call("grep", "{\"pattern\":\"x\",\"path\":2}").is_err());
+        // runcmd：name 可选字符串
+        assert!(check_call("runcmd", "{}").is_ok());
+        assert!(check_call("runcmd", "{\"name\":\"deploy\"}").is_ok());
+        assert!(check_call("runcmd", "{\"name\":1}").is_err());
+        // 白名单名字不再是"已知工具"（发现式注入后校验只认 7 个内建名）
+        assert!(check_call("deploy", "{}").unwrap_err().contains("未知工具"));
+        // start 已弃用为独立工具
+        assert!(check_call("start", "{}").unwrap_err().contains("未知工具"));
     }
 
     #[test]
-    fn check_call_propose_and_whitelist() {
-        let no: &[ApprovedCommand] = &[];
+    fn check_call_addcmd() {
         // 合法提案
         let good = "{\"name\":\"dev\",\"command\":\"npm run dev\",\"description\":\"开发服务器\",\"mode\":\"daemon\"}";
-        assert!(check_call("propose_command", good, no).is_ok());
-        // 非法 name（含空格/注入字符）→ 拒绝
+        assert!(check_call("addcmd", good).is_ok());
+        // 非法 name（含注入字符）→ 拒绝
         let bad = "{\"name\":\"a;b\",\"command\":\"x\",\"description\":\"d\",\"mode\":\"once\"}";
-        assert!(check_call("propose_command", bad, no).unwrap_err().contains("name"));
+        assert!(check_call("addcmd", bad).unwrap_err().contains("name"));
         // 非法 mode → 拒绝
         let badm = "{\"name\":\"ok\",\"command\":\"x\",\"description\":\"d\",\"mode\":\"forever\"}";
-        assert!(check_call("propose_command", badm, no).unwrap_err().contains("mode"));
-        // 白名单内外的同名命令：批准前未知，批准后放行（零参数）
-        assert!(check_call("dev", "{}", no).is_err());
-        let list = vec![ApprovedCommand {
-            name: "dev".into(),
-            command: "npm run dev".into(),
-            description: "d".into(),
-            mode: "daemon".into(),
-        }];
-        assert!(check_call("dev", "{}", &list).is_ok());
-        // /deletec 移除后工具消失：换空列表即回到"未知工具"
-        assert!(check_call("dev", "{}", no).unwrap_err().contains("未知工具"));
+        assert!(check_call("addcmd", badm).unwrap_err().contains("mode"));
+        // 缺 description → 拒绝
+        let nod = "{\"name\":\"ok\",\"command\":\"x\",\"mode\":\"once\"}";
+        assert!(check_call("addcmd", nod).unwrap_err().contains("description"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -11,7 +11,7 @@
 - API 调用不走 SDK：reqwest 直连 OpenAI 兼容 API + SSE 流式；tool_calls 增量累加器（按 index 归堆拼接 arguments）自己写，写一次
 - **注释教学要求**：读者是"会 C# 的 Rust 小白"。每个文件顶部写模块导读；Rust 特有语法点（所有权/借用、match、Option/Result、`?`、impl/trait、闭包、生命周期、迭代器、Arc/mpsc、RAII 等）出现时用简短注释解释，**尽量对比 C# 等价概念**（如 "`?` ≈ C# 里 catch 后 return null 的结构化写法"）。密度控制：讲语法点，不逐行翻译代码
 
-## 工具（仅 6 个）
+## 工具（固定 7 个，数组冻结）
 
 | 工具 | 说明 |
 |---|---|
@@ -20,16 +20,19 @@
 | edit | 精确替换 |
 | ls | 列目录 |
 | grep | 内容搜索 |
-| start | 执行配置的那一条命令（构建 / 类型检查 / 启动），返回输出。命令存于 `.do/`，AI 不可见 |
+| addcmd | 提案固定命令（name/command/description/mode），人类 `/addcmd` 审批后生效 |
+| runcmd | 发现式调用：无参列出白名单，带 name 执行。命令存于 `.do/commands.json`，AI 不可见 |
 
-无 bash。AI 拿编译反馈的唯一途径是 start。
+无自由 shell。`/setting start` 配的命令作为隐式条目并入白名单视图（不落盘），AI 用 `runcmd` 拿编译反馈。
+
+tools 数组永远冻结为这 7 个：prompt 缓存按 system + tools + messages 前缀匹配，批准命令不改变前缀（零缓存代价），白名单内容走 messages（本来逐轮增长，无额外 miss）。
 
 ## 配置与 slash 命令
 
 - **两层配置，覆盖合并**：工作区 `.do/config.json`（项目级，字段优先）> exe 旁 `do.config.json`（全局便携层，跟着 do.exe 走，删文件夹即完全卸载）> 内置默认值
 - 全局层只存三项：`url`、`key`、`model`（"人"的身份）；工作区层额外存 `start`（项目级，不进全局层）
 - `/setting <字段> <值>` 写工作区层（如 `/setting model gpt-4o`）；`/setting -g <字段> <值>` 写全局层（如 `/setting -g key sk-xxx`）；`-g start` 拒绝并提示 start 是项目级
-- 未设置 start 时，start 工具返回提示"请让使用者用 /setting start <命令> 设置"
+- 未设置 start 时，白名单视图无 start 条目，`runcmd` 调 `start` 报"未知命令"并附当前名单
 - 全局层对 AI **物理不可达**（在工作区之外）；`.do/` 对 AI **代码级隐形**：read/edit 访问 `.do` 内路径时，返回与"路径不存在"完全相同的反馈（不得暴露"被拒绝"）；ls 不列出它；grep 直接跳过
 - **唯一例外是 write**：对不存在的路径写入本应成功，装成"不存在"会自相矛盾。因此对 `.do` 内的写入返回普通的 I/O 失败（`Permission denied`，与操作系统权限拒绝一致）——AI 只能看出"这路径写不进去"，看不出这里藏着配置
 
@@ -89,4 +92,4 @@
 ## 待思考调整（记录）
 
 **1-7 已完成并清理**（v0.2 批次）：①Assistant 正文 Markdown 全量渲染（pulldown-cmark，仅 do crate，+194 KB）；②思考流式可见、正文开始自动折叠；③启动 splash（任意键/1.2s 跳过）；④/setting 独立设置页（key 掩码）；⑤工具调用函数样式 `read("src/main.rs")`；⑥Esc 取消（Arc<AtomicBool>，零新依赖）；⑦工具参数派发前校验、错误回填模型自愈。批次终态：38 测试全绿、clippy 零警告、do.exe 2.76 MB。
-8. ~~**固定命令白名单 `/addc` `/deletec`**~~ ✅ 已完成：AI 用内建工具 `propose_command` 提案（name 限 `^[a-zA-Z0-9_-]+$`、mode 二态，校验失败回填模型）；`/addc` 审批页 command 只读、name/description 可改名再批；批准落盘 `.do/commands.json`（对 AI 隐形）即成为零参数动态工具；`/deletec` 页面或带名直删。执行路径与 start 统一为 shell 包装（Windows `cmd /c` / Unix `sh -c`，修掉 npm.cmd 找不到的问题；审批常量零拼接故无注入面），cwd 固定工作区根，once 返回输出尾 20KB、daemon 后台 spawn 立即返回
+8. ~~**固定命令白名单 `/addcmd` `/deletecmd`**~~ ✅ 已完成：AI 用内建工具 `addcmd` 提案（name 限 `^[a-zA-Z0-9_-]+$`、mode 二态，校验失败回填模型）；`/addcmd` 审批页 command 只读、name/description 可改名再批；批准落盘 `.do/commands.json`（对 AI 隐形），`/deletecmd` 页面或带名直删；批准后 `Cmd::Notify` 以 user 角色注入历史告知模型。**后改为发现式注入（`runcmd` 工具）并弃用 start 独立工具**：tools 数组冻结为固定 7 个（read/write/edit/ls/grep/addcmd/runcmd），消除批准导致的 prompt 缓存前缀击穿——缓存按 system+tools+messages 前缀匹配，tools 不动则批准零缓存代价，白名单内容走 messages（本来逐轮增长）；`runcmd` 无参列白名单（含隐式 start 条目：config.start 非空时视图层并入，不落盘）、带名执行（once 尾 20KB / daemon 后台即返）、未知名错误附名单自愈；执行统一 shell 包装（Windows `cmd /c` / Unix `sh -c`，审批常量零拼接无注入面），cwd 固定工作区根；旧名 /addc /deletec 落入带新名的未知命令提示

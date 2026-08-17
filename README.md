@@ -41,11 +41,11 @@ It helps you write code. **Control stays with you.**
 |---|---|
 | `read` / `write` / `edit` | read, write, and patch files |
 | `ls` / `grep` | list directories, search content |
-| `start` | runs the **one command you configured** (build / typecheck) and feeds the output back to the AI |
+| `addcmd` / `runcmd` | propose / list & run whitelisted commands (see below) |
 
-No free-form shell. The AI's main channel for compiler feedback is `start` — you pick the command, it can only press the button.
+No free-form shell.
 
-**Command whitelist**: the AI can *propose* fixed commands (`propose_command`, e.g. `npm run dev`), but nothing executes until you approve them with `/addc`. Approved commands live in `.do/commands.json` and become zero-argument tools the AI may call — the approved string is all that ever runs, no parameters, always in the workspace root. `/deletec` revokes.
+**Command whitelist**: the AI can *propose* fixed commands with `addcmd` (e.g. `npm run dev`), but nothing executes until you approve them with `/addcmd`. Approved commands live in `.do/commands.json`; the AI discovers and invokes them through the `runcmd` tool (`runcmd()` lists, `runcmd("name")` runs) — the approved string is all that ever runs, no parameters, always in the workspace root. Your configured `start` command shows up as an implicit whitelist entry. `/deletecmd` revokes.
 
 ## Safety: the workspace is the boundary
 
@@ -76,6 +76,7 @@ Then just talk: "check the error in src/main.rs".
 |---|---|
 | `/setting [-g] <url\|key\|model\|start> <value>` | change config (`-g` writes the global layer) |
 | `/new` | new conversation (auto-resumes from HANDOFF.md) |
+| `/addcmd` / `/deletecmd [name]` | approve / revoke whitelisted commands |
 | `/quit` or `Ctrl+C` | exit |
 | `Ctrl+E` | expand/collapse thinking & tool calls |
 | `PageUp / PageDown` | scroll history |

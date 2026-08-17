@@ -15,7 +15,7 @@
 
 mod agent;
 mod api;
-pub mod commands; // pub：TUI 的 /addc /deletec 与测试复用
+pub mod commands; // pub：TUI 的 /addcmd /deletecmd 与测试复用
 pub mod config; // pub 给集成测试复用
 mod tools;
 pub mod workspace; // pub 给集成测试复用
