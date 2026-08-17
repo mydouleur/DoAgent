@@ -11,7 +11,11 @@ edition = "2021"
 agent_core = { package = "core", path = "../core" }
 tokio.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 ratatui = { workspace = true, features = ["crossterm"] }
 crossterm.workspace = true
 unicode-width.workspace = true
 futures-util.workspace = true
+# Markdown 渲染只发生在 TUI 渲染层（core 不依赖）。
+# default-features=false 去掉 html/getopts，只要事件流解析器本体
+pulldown-cmark = { version = "0.12", default-features = false }

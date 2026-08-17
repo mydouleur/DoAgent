@@ -5,3 +5,6 @@
 .do/
 do.config.json
 HANDOFF.md
+
+# 试玩沙盒（try.cmd 的启动目录）
+/test

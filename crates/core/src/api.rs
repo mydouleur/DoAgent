@@ -19,6 +19,7 @@ use crate::tools::ToolDef;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 一次完整的模型回复（流结束后的累积结果）
 #[derive(Debug, Default)]
@@ -29,6 +30,8 @@ pub struct Reply {
     pub reasoning: String,
     /// 模型请求的工具调用（通常 0 或 1 个，协议允许并行多个）
     pub tool_calls: Vec<ToolCall>,
+    /// 本轮是否被用户取消（Esc）——半截内容保留在此结构里
+    pub cancelled: bool,
 }
 
 /// 一次工具调用。arguments 是**未解析的 JSON 字符串**（协议原样），
@@ -69,10 +72,13 @@ fn tools_json(defs: &[ToolDef]) -> Value {
 /// 发起一轮流式对话。
 /// `on_delta` 是回调（FnMut ≈ C# 的 Action<Delta> 委托），
 /// 每个增量到达时同步调用——借它把流实时转成 TUI 事件。
+/// `cancel` 是取消标志：每个 SSE chunk 处理前检查一次，
+/// 置位则带着半截累积结果提前返回（cancelled = true）。
 pub async fn chat(
     cfg: &Config,
     messages: &[Value],
     defs: &[ToolDef],
+    cancel: &AtomicBool,
     mut on_delta: impl FnMut(Delta),
 ) -> Result<Reply, String> {
     let client = reqwest::Client::new();
@@ -104,6 +110,12 @@ pub async fn chat(
 
     // `while let Some(x) = ... .await`：异步迭代 ≈ await foreach
     while let Some(event) = stream.next().await {
+        // 取消检查点①：每个 chunk 处理前看标志。Relaxed 足够——
+        // 纯标志位，没有需要顺带同步的其他数据（≈ C# volatile 读）
+        if cancel.load(Ordering::Relaxed) {
+            acc.reply.cancelled = true;
+            break;
+        }
         let event = event.map_err(|e| e.to_string())?;
         if event.data == "[DONE]" {
             break;

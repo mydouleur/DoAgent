@@ -1,16 +1,20 @@
-//! TUI：对话流渲染 + 输入 + slash 命令 + 状态栏
+//! TUI：启动画面 + 对话流 + 输入 + slash 命令 + 设置页 + 状态栏
 //!
 //! # 模块导读
 //! 单事件循环驱动一切：crossterm 的键盘事件由一个专用线程转发进
-//! tokio channel，与 agent actor 的事件在 `tokio::select!` 里汇合——
-//! 两类事件都非阻塞等待，单线程 runtime 完全够用。
+//! tokio channel，与 agent actor 的事件、splash 定时器在
+//! `tokio::select!` 里汇合——全部非阻塞等待，单线程 runtime 够用。
 //!
-//! # 交互约定
-//! - Enter 发送；Ctrl+C 或 /quit 退出；Ctrl+E 全部展开/折叠；
-//!   PageUp/PageDown 滚动对话流。
-//! - 配色：思考灰、工具青、正文默认色。折叠块只显示一行摘要，
-//!   如 `read(src/main.rs)`、`思考 (+128 字)`。
-//! - 底部状态栏：`~N tok | model | 工作区`（token 是 chars/4 粗估）。
+//! # 三种界面模式（[`Mode`]）
+//! - Splash：启动画面，logo + 版本 + 配置状态；任意键或 ~1.2s 自动进入对话
+//! - Chat：对话主界面（流式正文/思考/工具调用、slash 命令、Esc 取消）
+//! - Settings：/setting 独立设置页（↑↓ 选字段、Enter 编辑、Esc 返回）
+//!
+//! # 交互约定（Chat 模式）
+//! - Enter 发送；Ctrl+C 退出；Esc 取消当前轮（仅 agent 工作时响应）；
+//!   Ctrl+E 全部展开/折叠；↑↓ 或 PageUp/PageDown 滚动。
+//! - 配色：思考灰、工具青、正文默认色。折叠块只显示一行摘要。
+//! - 底部两行：快捷键提示行（上下文感知）+ 状态栏 `~N tok | model | 工作区`。
 //!
 //! # 核心概念
 //! - RAII / Drop：[`TerminalGuard`] 离开作用域时自动恢复终端——
@@ -27,11 +31,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Terminal;
+use ratatui::{Frame, Terminal};
 use std::io;
 use std::path::Path;
 use unicode_width::UnicodeWidthChar;
@@ -49,21 +53,41 @@ const LOGO: &str = "\
 ░████                                              ░████ 
                                                          ";
 
+/// 三种界面模式
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// 启动画面：任意键或定时器自动跳过，不强制等待
+    Splash,
+    /// 对话主界面
+    Chat,
+    /// /setting 独立设置页
+    Settings,
+}
+
 /// 对话流里的一条记录
 enum Item {
     /// 用户输入（含注入的 HANDOFF.md）
     User(String),
-    /// 思考过程（reasoning，流式增长）
-    Reasoning(String),
-    /// 一次工具调用 + 截断后的结果
+    /// 思考过程。流式期间 open=true 实时可见（等待时能看到进展）；
+    /// 正文一开始输出就自动折叠为一行摘要
+    Reasoning { text: String, open: bool },
+    /// 一次工具调用：args 是**原始 JSON 字符串**，展示层决定怎么渲染
     Tool { name: String, args: String, result: String },
-    /// 正文回复（流式增长）
+    /// 正文回复（流式增长，经 Markdown 渲染）
     Assistant(String),
     /// 本地提示（slash 反馈、启动信息等）
     Info(String),
     /// 错误
     Error(String),
 }
+
+/// 设置页字段表：字段名 + 是否全局层（false = 工作区层）
+const SETTINGS_FIELDS: &[(&str, bool)] = &[
+    ("url", true),
+    ("key", true),
+    ("model", true),
+    ("start", false),
+];
 
 /// TUI 全部可变状态（单所有者，单线程 runtime 下无需锁）
 struct Ui {
@@ -79,6 +103,17 @@ struct Ui {
     workspace: String,
     /// true 时退出主循环
     quit: bool,
+    mode: Mode,
+    /// agent 正在工作：此时 Esc = 取消本轮；平时 Esc 不响应
+    busy: bool,
+    /// 已发出取消、等待 agent 收尾（Done 到达时补一行"（已取消）"）
+    cancel_pending: bool,
+    /// 设置页：当前选中字段下标
+    set_sel: usize,
+    /// 设置页：编辑态缓冲（None = 非编辑态）
+    set_editing: Option<String>,
+    /// 设置页：进入时载入的各字段当前值（key 存真值，显示时才掩码）
+    set_values: Vec<String>,
 }
 
 /// RAII 守卫：构造时进 alternate screen + raw mode，Drop 时恢复。
@@ -133,11 +168,14 @@ pub async fn run(root: &Path) -> io::Result<()> {
         has_key: !cfg.key.is_empty(),
         workspace: root.display().to_string(),
         quit: false,
+        mode: Mode::Splash,
+        busy: false,
+        cancel_pending: false,
+        set_sel: 0,
+        set_editing: None,
+        set_values: Vec::new(),
     };
-    // 启动画面：logo 逐字展示
-    for line in LOGO.lines() {
-        ui.items.push(Item::Info(line.to_string()));
-    }
+    // 启动信息（splash 下面的对话流里保留这几行供回看）
     ui.items.push(Item::Info(format!("工作区: {}", ui.workspace)));
     if exe_dir.is_none() {
         // 降级提示：全局层不可用但不影响使用，绝不 panic
@@ -146,11 +184,14 @@ pub async fn run(root: &Path) -> io::Result<()> {
         ));
     }
     if !ui.has_key {
-        ui.items.push(Item::Info("未设置 API key，请用 /setting key <你的key>".into()));
+        ui.items.push(Item::Info("未设置 API key，请用 /setting -g key <你的key>".into()));
     }
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
+
+    // splash 自动跳过时刻：约 1.2 秒
+    let splash_until = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
 
     while !ui.quit {
         draw(&mut term, &ui)?;
@@ -164,12 +205,17 @@ pub async fn run(root: &Path) -> io::Result<()> {
                 let Some(ev) = ev else { break };
                 handle_agent(&mut ui, ev);
             }
+            // `if` 条件分支：只在 splash 期间启用定时器
+            // ≈ C# 里 Task.WhenAny(keys, Task.Delay(1200)) 的条件版
+            _ = tokio::time::sleep_until(splash_until), if ui.mode == Mode::Splash => {
+                ui.mode = Mode::Chat;
+            }
         }
     }
     Ok(())
 }
 
-/// 键盘事件处理（输入框、滚动、快捷键的唯一入口）
+/// 键盘事件总入口：先按模式分流，各模式自己的处理器再细分按键
 fn handle_key(ui: &mut Ui, ev: Event, agent: &mut AgentHandle, root: &Path) {
     let Event::Key(KeyEvent { code, modifiers, kind, .. }) = ev else { return };
     // crossterm 经典坑：Windows 上一次按键会同时发出 Press 和 Release
@@ -179,11 +225,24 @@ fn handle_key(ui: &mut Ui, ev: Event, agent: &mut AgentHandle, root: &Path) {
     if kind != KeyEventKind::Press {
         return;
     }
+    // Ctrl+C 在任何界面都是退出
+    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+        ui.quit = true;
+        return;
+    }
+    match ui.mode {
+        // splash：任意键跳过（定时器也会自动跳过）
+        Mode::Splash => ui.mode = Mode::Chat,
+        Mode::Settings => settings_key(ui, code, root),
+        Mode::Chat => chat_key(ui, code, modifiers, agent, root),
+    }
+}
+
+/// Chat 模式的按键：输入框 / 滚动 / 快捷键 / Esc 取消
+fn chat_key(ui: &mut Ui, code: KeyCode, modifiers: KeyModifiers, agent: &mut AgentHandle, root: &Path) {
     if modifiers.contains(KeyModifiers::CONTROL) {
-        match code {
-            KeyCode::Char('c') => ui.quit = true,
-            KeyCode::Char('e') => ui.expand_all = !ui.expand_all,
-            _ => {}
+        if code == KeyCode::Char('e') {
+            ui.expand_all = !ui.expand_all;
         }
         return;
     }
@@ -191,6 +250,13 @@ fn handle_key(ui: &mut Ui, ev: Event, agent: &mut AgentHandle, root: &Path) {
         KeyCode::Enter => submit(ui, agent, root),
         // Tab：slash 命令补全为第一个候选（见 slash_candidates）
         KeyCode::Tab => tab_complete(ui),
+        // Esc 取消：只在 agent 工作时响应（置位共享标志），平时不响应
+        KeyCode::Esc => {
+            if ui.busy {
+                agent.send(Cmd::Cancel);
+                ui.cancel_pending = true;
+            }
+        }
         // 输入框字符：c 是 Unicode 标量，CJK 直接进字符串
         KeyCode::Char(c) => ui.input.push(c),
         KeyCode::Backspace => {
@@ -199,27 +265,117 @@ fn handle_key(ui: &mut Ui, ev: Event, agent: &mut AgentHandle, root: &Path) {
         }
         KeyCode::PageUp => ui.scroll = ui.scroll.saturating_add(10),
         KeyCode::PageDown => ui.scroll = ui.scroll.saturating_sub(10),
+        // 上下键与 PgUp/PgDn 行为重合，但步长更细（3 行 vs 10 行），适合精读
+        KeyCode::Up => ui.scroll = ui.scroll.saturating_add(3),
+        KeyCode::Down => ui.scroll = ui.scroll.saturating_sub(3),
         _ => {}
+    }
+}
+
+/// Settings 模式的按键：选择 / 编辑 / 退出
+fn settings_key(ui: &mut Ui, code: KeyCode, root: &Path) {
+    // 编辑态：Enter 保存、Esc 放弃、字符进缓冲
+    if ui.set_editing.is_some() {
+        match code {
+            KeyCode::Enter => {
+                let value = ui.set_editing.take().unwrap_or_default();
+                settings_save(ui, root, value);
+            }
+            KeyCode::Esc => ui.set_editing = None,
+            KeyCode::Char(c) => {
+                if let Some(buf) = &mut ui.set_editing {
+                    buf.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = &mut ui.set_editing {
+                    buf.pop();
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    // 选择态
+    match code {
+        KeyCode::Up => ui.set_sel = ui.set_sel.saturating_sub(1),
+        KeyCode::Down => ui.set_sel = (ui.set_sel + 1).min(SETTINGS_FIELDS.len() - 1),
+        // 进入编辑态：缓冲预填当前真值（key 给的是未掩码的真值）
+        KeyCode::Enter => ui.set_editing = Some(ui.set_values[ui.set_sel].clone()),
+        KeyCode::Esc => ui.mode = Mode::Chat,
+        _ => {}
+    }
+}
+
+/// 设置页保存一个字段：写哪层只读写哪层（与 /setting 命令同一纪律）
+fn settings_save(ui: &mut Ui, root: &Path, value: String) {
+    let (field, global) = SETTINGS_FIELDS[ui.set_sel];
+    let result = if global {
+        match agent_core::config::exe_dir() {
+            Some(dir) => {
+                let mut cfg = Config::load_global(&dir);
+                cfg.set(field, &value)
+                    .and_then(|()| cfg.save_global(&dir).map_err(|e| e.to_string()))
+            }
+            None => Err("无法定位 do.exe 目录，全局配置层不可用".to_string()),
+        }
+    } else {
+        let mut cfg = Config::load_workspace(root);
+        cfg.set(field, &value)
+            .and_then(|()| cfg.save(root).map_err(|e| e.to_string()))
+    };
+    match result {
+        Ok(()) => {
+            ui.set_values[ui.set_sel] = value.clone();
+            // 两层都影响状态栏，保存后刷新
+            if field == "model" {
+                ui.model = if value.is_empty() { "未设置".into() } else { value.clone() };
+            }
+            if field == "key" {
+                ui.has_key = !value.is_empty();
+            }
+            ui.items.push(Item::Info(format!(
+                "已更新{} {field}",
+                if global { " 全局" } else { "" }
+            )));
+        }
+        Err(e) => ui.items.push(Item::Info(e)),
     }
 }
 
 /// agent 事件处理：流式增量拼到对话流最后一条同类记录上
 fn handle_agent(ui: &mut Ui, ev: Evt) {
     match ev {
-        Evt::Text(t) => match ui.items.last_mut() {
-            Some(Item::Assistant(s)) => s.push_str(&t),
-            _ => ui.items.push(Item::Assistant(t)),
-        },
+        Evt::Text(t) => {
+            // 正文开始输出 → 展开中的思考块全部自动折叠。
+            // 流式期间它们是实时可见的（open=true），正文一来就让位
+            for item in &mut ui.items {
+                if let Item::Reasoning { open, .. } = item {
+                    *open = false;
+                }
+            }
+            match ui.items.last_mut() {
+                Some(Item::Assistant(s)) => s.push_str(&t),
+                _ => ui.items.push(Item::Assistant(t)),
+            }
+        }
         Evt::Reasoning(r) => match ui.items.last_mut() {
-            Some(Item::Reasoning(s)) => s.push_str(&r),
-            _ => ui.items.push(Item::Reasoning(r)),
+            Some(Item::Reasoning { text, .. }) => text.push_str(&r),
+            _ => ui.items.push(Item::Reasoning { text: r, open: true }),
         },
         Evt::Tool { name, args, result } => {
             ui.items.push(Item::Tool { name, args, result });
         }
         Evt::Error(e) => ui.items.push(Item::Error(e)),
         Evt::Tokens(n) => ui.tokens = n,
-        Evt::Done => {}
+        Evt::Done => {
+            ui.busy = false;
+            if ui.cancel_pending {
+                // 取消的收尾：半截内容已保留，补一行说明
+                ui.cancel_pending = false;
+                ui.items.push(Item::Info("（已取消）".into()));
+            }
+        }
     }
 }
 
@@ -235,10 +391,11 @@ fn submit(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
         return;
     }
     if !ui.has_key {
-        ui.items.push(Item::Info("未设置 API key，请用 /setting key <你的key>".into()));
+        ui.items.push(Item::Info("未设置 API key，请用 /setting -g key <你的key>".into()));
         return;
     }
     ui.items.push(Item::User(text.clone()));
+    ui.busy = true; // 进入工作态：Esc 变为可取消
     agent.send(Cmd::Chat(text));
 }
 
@@ -260,12 +417,15 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                     let msg = format!("交接文档 HANDOFF.md 内容如下：\n{h}");
                     ui.items.push(Item::User(msg.clone()));
                     if ui.has_key {
+                        ui.busy = true;
                         agent.send(Cmd::Chat(msg));
                     }
                 }
                 _ => ui.items.push(Item::Info("已清空上下文（无 HANDOFF.md 可注入）".into())),
             }
         }
+        // 裸 /setting（无参数）→ 进入独立设置页
+        "setting" if arg.is_empty() => enter_settings(ui, root),
         "setting" => {
             // `-g` 前缀写全局便携层（exe 旁 do.config.json），否则写工作区层。
             // strip_prefix 命中时返回去掉前缀后的剩余切片（Option 语义）
@@ -290,7 +450,7 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                         let mut cfg = Config::load_global(&dir);
                         cfg.set_global(field, value)
                             .and_then(|()| cfg.save_global(&dir).map_err(|e| e.to_string()))
-                            .map(|()| format!("已更新全局 {field}"))
+                            .map(|()| format!("已更新 全局 {field}"))
                     }
                     None => Err("无法定位 do.exe 目录，全局配置层不可用".to_string()),
                 }
@@ -302,7 +462,6 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
             };
             match result {
                 Ok(msg) => {
-                    // 两层都影响状态栏，所以无论写哪层都刷新
                     if field == "model" {
                         ui.model = value.to_string();
                     }
@@ -318,7 +477,46 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
     }
 }
 
-/// slash 命令候选表：命令名 + 用法提示（渲染在输入框上方那一行）
+/// 进入设置页：载入两层当前值
+fn enter_settings(ui: &mut Ui, root: &Path) {
+    let global = agent_core::config::exe_dir().map(|d| Config::load_global(&d));
+    let ws = Config::load_workspace(root);
+    ui.set_values = SETTINGS_FIELDS
+        .iter()
+        .map(|(field, is_global)| {
+            let cfg = if *is_global { global.as_ref() } else { Some(&ws) };
+            cfg.map(|c| cfg_field(c, field)).unwrap_or_default()
+        })
+        .collect();
+    ui.set_sel = 0;
+    ui.set_editing = None;
+    ui.mode = Mode::Settings;
+}
+
+/// 按字段名取配置值（设置页载入用）
+fn cfg_field(cfg: &Config, field: &str) -> String {
+    match field {
+        "url" => cfg.url.clone(),
+        "key" => cfg.key.clone(),
+        "model" => cfg.model.clone(),
+        "start" => cfg.start.clone(),
+        _ => String::new(),
+    }
+}
+
+/// key 掩码：保留前 3 后 4 位（如 sk-****xxxx）；太短的整串打码
+fn mask_key(key: &str) -> String {
+    let n = key.chars().count();
+    if n > 7 {
+        let head: String = key.chars().take(3).collect();
+        let tail: String = key.chars().skip(n - 4).collect();
+        format!("{head}****{tail}")
+    } else {
+        "****".to_string()
+    }
+}
+
+/// slash 命令候选表：命令名 + 用法提示（渲染在状态栏上方的提示行）
 /// 数组 + 切片 ≈ C# 的静态只读表；零分配、零组件，够用就好。
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/setting", "/setting [-g] <url|key|model|start> <值>"),
@@ -352,31 +550,87 @@ fn tab_complete(ui: &mut Ui) {
     }
 }
 
+/// 工具调用的折叠态渲染：函数调用样式，更接近程序员直觉。
+/// 取各工具主参数：read/write/edit/ls 取 path，grep 取 pattern+path，
+/// start 无参；JSON 解析失败或主参数缺失时兜底 `name()`。
+fn format_call(name: &str, args_json: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return format!("{name}()");
+    };
+    // {:?} 调试格式给字符串加引号并转义，正好就是调用语法里的字符串字面量
+    let arg = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| format!("{s:?}"));
+    match name {
+        "read" | "write" | "edit" => match arg("path") {
+            Some(p) => format!("{name}({p})"),
+            None => format!("{name}()"),
+        },
+        "grep" => match (arg("pattern"), arg("path")) {
+            (Some(p), Some(d)) => format!("grep({p}, {d})"),
+            (Some(p), None) => format!("grep({p})"),
+            _ => "grep()".to_string(),
+        },
+        "ls" => match arg("path") {
+            Some(p) => format!("ls({p})"),
+            None => "ls()".to_string(),
+        },
+        _ => format!("{name}()"),
+    }
+}
+
+/// 状态栏上方的上下文提示行：slash 候选优先，其次按模式给快捷键提示
+fn hint_text(ui: &Ui) -> String {
+    if ui.mode == Mode::Chat {
+        let slash = slash_hint(&ui.input);
+        if !slash.is_empty() {
+            return slash; // slash 输入时，候选提示保持优先
+        }
+    }
+    match ui.mode {
+        Mode::Splash => "按任意键继续".to_string(),
+        Mode::Settings => if ui.set_editing.is_some() {
+            "Enter 保存 · Esc 放弃".to_string()
+        } else {
+            "↑↓ 选择 · Enter 编辑 · Esc 返回".to_string()
+        },
+        Mode::Chat => if ui.busy {
+            "^E 展开/折叠 · Esc 取消 · ↑↓/PgUp/Dn 滚动 · ^C 退出".to_string()
+        } else {
+            // agent 不忙时省略 Esc 项（此时 Esc 不响应）
+            "^E 展开/折叠 · ↑↓/PgUp/Dn 滚动 · ^C 退出".to_string()
+        },
+    }
+}
+
 /// 渲染一帧
 fn draw(term: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &Ui) -> io::Result<()> {
     term.draw(|frame| {
         let area = frame.area();
-        // slash 提示行只在输入以 `/` 开头且有候选时出现
-        let hint = slash_hint(&ui.input);
-        let has_hint = !hint.is_empty();
-        // 纵向布局：对话流（吃满剩余）/ [slash 提示行] / 输入行 / 状态栏
-        let mut constraints = vec![Constraint::Min(1)];
-        if has_hint {
-            constraints.push(Constraint::Length(1));
+        if ui.mode == Mode::Splash {
+            draw_splash(frame, area, ui);
+            return;
         }
-        constraints.push(Constraint::Length(1)); // 输入行
-        constraints.push(Constraint::Length(1)); // 状态栏
+        // 纵向四段：对话流（吃满剩余）/ 提示行 / 输入行 / 状态栏
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(area);
 
-        // 对话流：先按当前宽度折成物理行，再按滚动位置切片
+        // 主区域：Chat = 对话流；Settings = 设置页
         let width = chunks[0].width as usize;
-        let lines = build_lines(ui, width);
+        let lines = match ui.mode {
+            Mode::Settings => settings_lines(ui),
+            _ => build_lines(ui, width),
+        };
         let height = chunks[0].height as usize;
         let total = lines.len();
-        let bottom_skip = ui.scroll.min(total.saturating_sub(height));
+        // 设置页不滚动（内容一屏内），对话流正常滚动
+        let scroll = if ui.mode == Mode::Settings { 0 } else { ui.scroll };
+        let bottom_skip = scroll.min(total.saturating_sub(height));
         let start = total.saturating_sub(height + bottom_skip);
         let visible: Vec<Line> = lines
             .into_iter()
@@ -385,33 +639,112 @@ fn draw(term: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &Ui) -> io::Resul
             .collect();
         frame.render_widget(Paragraph::new(visible), chunks[0]);
 
-        // 输入行与状态栏的位置取决于提示行是否存在
-        let (input_idx, status_idx) = if has_hint { (2, 3) } else { (1, 2) };
-        if has_hint {
-            frame.render_widget(
-                Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
-                chunks[1],
-            );
-        }
+        // 提示行（上下文感知，slash 候选优先）
+        frame.render_widget(
+            Paragraph::new(hint_text(ui)).style(Style::default().fg(Color::DarkGray)),
+            chunks[1],
+        );
 
-        // 输入行
-        let prompt = format!("> {}", ui.input);
-        frame.render_widget(Paragraph::new(prompt), chunks[input_idx]);
-        // 光标定位到输入末尾（CJK 按显示宽度算）
-        let cx = 2 + unicode_width::UnicodeWidthStr::width(ui.input.as_str());
-        frame.set_cursor_position((
-            (cx as u16).min(chunks[input_idx].width.saturating_sub(1)),
-            chunks[input_idx].y,
-        ));
+        // 输入行：Chat = 输入框；Settings 编辑态 = 字段编辑框
+        match ui.mode {
+            Mode::Settings => {
+                if let Some(buf) = &ui.set_editing {
+                    let (field, _) = SETTINGS_FIELDS[ui.set_sel];
+                    let prompt = format!("{field} = {buf}");
+                    frame.render_widget(Paragraph::new(prompt), chunks[2]);
+                    let cx = field.len() + 3 + unicode_width::UnicodeWidthStr::width(buf.as_str());
+                    frame.set_cursor_position((
+                        (cx as u16).min(chunks[2].width.saturating_sub(1)),
+                        chunks[2].y,
+                    ));
+                } else {
+                    frame.render_widget(Paragraph::new(""), chunks[2]);
+                }
+            }
+            _ => {
+                let prompt = format!("> {}", ui.input);
+                frame.render_widget(Paragraph::new(prompt), chunks[2]);
+                // 光标定位到输入末尾（CJK 按显示宽度算）
+                let cx = 2 + unicode_width::UnicodeWidthStr::width(ui.input.as_str());
+                frame.set_cursor_position((
+                    (cx as u16).min(chunks[2].width.saturating_sub(1)),
+                    chunks[2].y,
+                ));
+            }
+        }
 
         // 状态栏：~N tok | model | 工作区
         let status = format!("~{} tok | {} | {}", ui.tokens, ui.model, ui.workspace);
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
-            chunks[status_idx],
+            chunks[3],
         );
     })?;
     Ok(())
+}
+
+/// 启动画面：logo 居中 + 版本号 + 配置状态 + 跳过提示
+fn draw_splash(frame: &mut Frame, area: Rect, ui: &Ui) {
+    let mut lines: Vec<Line> = LOGO
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Cyan))))
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("DoAgent v{}", env!("CARGO_PKG_VERSION"))));
+    lines.push(Line::from(format!("工作区: {}", ui.workspace)));
+    lines.push(Line::from(if ui.has_key {
+        "key 已设置".to_string()
+    } else {
+        "key 未设置：/setting -g key <你的key>".to_string()
+    }));
+    lines.push(Line::from(format!("model: {}", ui.model)));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "按任意键继续",
+        Style::default().fg(Color::DarkGray),
+    )));
+    // 垂直居中：上缘下移 (高度-内容)/2；水平居中交给 Alignment::Center
+    let content_h = lines.len() as u16;
+    let top = area.height.saturating_sub(content_h) / 2;
+    let centered = Rect {
+        y: area.y + top,
+        height: content_h.min(area.height),
+        ..area // 结构体更新语法：其余字段（x/width）沿用 area
+    };
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), centered);
+}
+
+/// 设置页内容：全局区 + 工作区，选中行青色高亮
+fn settings_lines(ui: &Ui) -> Vec<Line<'static>> {
+    let section = Style::default().fg(Color::DarkGray);
+    let mut out = vec![
+        Line::from(""),
+        Line::from(Span::styled("全局（exe 旁 do.config.json）", section)),
+    ];
+    for (i, (field, _)) in SETTINGS_FIELDS.iter().enumerate() {
+        if i == 3 {
+            out.push(Line::from(""));
+            out.push(Line::from(Span::styled("工作区（.do/config.json）", section)));
+        }
+        // key 显示掩码；空值显示占位
+        let shown = if *field == "key" {
+            mask_key(&ui.set_values[i])
+        } else {
+            ui.set_values[i].clone()
+        };
+        let shown = if shown.is_empty() { "（未设置）".to_string() } else { shown };
+        let selected = i == ui.set_sel;
+        let style = if selected {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        out.push(Line::from(Span::styled(
+            format!("{} {field:<6} = {shown}", if selected { ">" } else { " " }),
+            style,
+        )));
+    }
+    out
 }
 
 /// 把对话流摊平成物理行（含折行），每行一个样式
@@ -421,26 +754,31 @@ fn build_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
     for item in &ui.items {
         match item {
             Item::User(t) => push_styled(&mut out, &format!("» {t}"), w, Style::default()),
-            Item::Assistant(t) => push_styled(&mut out, t, w, Style::default()),
-            Item::Reasoning(t) => {
+            Item::Assistant(t) => {
+                // 正文过 Markdown 渲染：每帧对完整文本重新解析（量小无感），
+                // 流式中间态的不完整 md 由解析器自然降级（见 md 模块导读）
+                for line in crate::md::render(t) {
+                    // span 级折行：在 span 边界内按字符宽度切，样式不被切断
+                    out.extend(wrap_spans(line, w));
+                }
+            }
+            Item::Reasoning { text, open } => {
                 let style = Style::default().fg(Color::DarkGray);
-                if ui.expand_all {
-                    push_styled(&mut out, &format!("思考: {t}"), w, style);
+                if ui.expand_all || *open {
+                    push_styled(&mut out, &format!("思考: {text}"), w, style);
                 } else {
-                    push_styled(&mut out, &format!("思考 (+{} 字)", t.chars().count()), w, style);
+                    push_styled(&mut out, &format!("思考 (+{} 字)", text.chars().count()), w, style);
                 }
             }
             Item::Tool { name, args, result } => {
-                // 折叠态一行摘要，如 read(src/main.rs)
+                // 折叠态：函数调用样式，如 read("src/main.rs")
                 let style = Style::default().fg(Color::Cyan);
-                let head = if args.is_empty() {
-                    format!("{name}()")
-                } else {
-                    format!("{name}({args})")
-                };
-                push_styled(&mut out, &head, w, style);
+                push_styled(&mut out, &format_call(name, args), w, style);
                 if ui.expand_all {
-                    push_styled(&mut out, &indent(result), w, style.add_modifier(Modifier::DIM));
+                    // 展开态：完整 args（原始 JSON）+ 截断后的结果
+                    let dim = style.add_modifier(Modifier::DIM);
+                    push_styled(&mut out, &indent(args), w, dim);
+                    push_styled(&mut out, &indent(result), w, dim);
                 }
             }
             Item::Info(t) => push_styled(&mut out, t, w, Style::default().fg(Color::DarkGray)),
@@ -465,6 +803,33 @@ fn indent(text: &str) -> String {
         .join("\n")
 }
 
+/// span 感知折行：与 wrap_text 同样的贪心切分，但输入是带样式的
+/// Line——逐字符推进、同样式合并，保证样式 span 在宽字符（CJK）处
+/// 也不会被从中间切断（切的是字符边界，不是样式边界）。
+fn wrap_spans(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut w = 0;
+    for span in line.spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > width && !cur.is_empty() {
+                out.push(Line::from(std::mem::take(&mut cur)));
+                w = 0;
+            }
+            // 与行尾 span 同样式就追加合并，避免一字符一 span 的碎片
+            match cur.last_mut() {
+                Some(last) if last.style == style => last.content.to_mut().push(ch),
+                _ => cur.push(Span::styled(ch.to_string(), style)),
+            }
+            w += cw;
+        }
+    }
+    out.push(Line::from(cur));
+    out
+}
+
 /// CJK 感知的折行：按字符显示宽度贪心切分。
 /// unicode-width 给出每个 char 的终端列宽（ASCII=1，CJK=2）。
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -486,10 +851,30 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造一个最小可用的 Ui（测试夹具）
+    fn test_ui() -> Ui {
+        Ui {
+            items: Vec::new(),
+            input: String::new(),
+            scroll: 0,
+            expand_all: false,
+            tokens: 0,
+            model: String::new(),
+            has_key: false,
+            workspace: String::new(),
+            quit: false,
+            mode: Mode::Chat,
+            busy: false,
+            cancel_pending: false,
+            set_sel: 0,
+            set_editing: None,
+            set_values: Vec::new(),
+        }
+    }
 
     #[test]
     fn slash_hint_filters_by_prefix() {
@@ -509,22 +894,96 @@ mod tests {
 
     #[test]
     fn tab_completes_first_candidate() {
-        let mut ui = Ui {
-            items: Vec::new(),
-            input: "/s".to_string(),
-            scroll: 0,
-            expand_all: false,
-            tokens: 0,
-            model: String::new(),
-            has_key: false,
-            workspace: String::new(),
-            quit: false,
-        };
+        let mut ui = test_ui();
+        ui.input = "/s".to_string();
         tab_complete(&mut ui);
         assert_eq!(ui.input, "/setting");
         // 非 slash 输入不补全
         ui.input = "abc".to_string();
         tab_complete(&mut ui);
         assert_eq!(ui.input, "abc");
+    }
+
+    #[test]
+    fn reasoning_auto_collapses_when_text_starts() {
+        let mut ui = test_ui();
+        // 流式期间：思考块实时可见（open=true）
+        handle_agent(&mut ui, Evt::Reasoning("想想".into()));
+        match ui.items.last() {
+            Some(Item::Reasoning { open, .. }) => assert!(open),
+            _ => panic!("应为 Reasoning"),
+        }
+        // 正文开始输出 → 思考块自动折叠
+        handle_agent(&mut ui, Evt::Text("答".into()));
+        match &ui.items[0] {
+            Item::Reasoning { open, .. } => assert!(!open),
+            _ => panic!("应为 Reasoning"),
+        }
+        // 取消的收尾：Done 到达时补一行"（已取消）"
+        ui.busy = true;
+        ui.cancel_pending = true;
+        handle_agent(&mut ui, Evt::Done);
+        assert!(!ui.busy);
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("已取消")));
+    }
+
+    #[test]
+    fn tool_call_rendered_as_function() {
+        assert_eq!(format_call("read", "{\"path\":\"src/main.rs\"}"), "read(\"src/main.rs\")");
+        assert_eq!(
+            format_call("grep", "{\"pattern\":\"foo\",\"path\":\"src/\"}"),
+            "grep(\"foo\", \"src/\")"
+        );
+        assert_eq!(format_call("grep", "{\"pattern\":\"foo\"}"), "grep(\"foo\")");
+        assert_eq!(format_call("ls", "{}"), "ls()");
+        assert_eq!(format_call("start", "{}"), "start()");
+        // JSON 解析失败 / 主参数缺失 → 兜底 name()
+        assert_eq!(format_call("read", "not json"), "read()");
+        assert_eq!(format_call("write", "{}"), "write()");
+    }
+
+    #[test]
+    fn key_masking_keeps_head3_tail4() {
+        assert_eq!(mask_key("sk-abcdefghij"), "sk-****ghij");
+        assert_eq!(mask_key("short"), "****");
+        assert_eq!(mask_key(""), "****");
+    }
+
+    #[test]
+    fn hint_line_is_context_aware() {
+        let mut ui = test_ui();
+        // 对话空闲：无 Esc 项
+        assert!(!hint_text(&ui).contains("Esc 取消"));
+        // agent 工作：出现 Esc 取消
+        ui.busy = true;
+        assert!(hint_text(&ui).contains("Esc 取消"));
+        // slash 输入时候选提示优先
+        ui.input = "/s".to_string();
+        assert!(hint_text(&ui).contains("/setting"));
+        // 设置页
+        ui.input.clear();
+        ui.mode = Mode::Settings;
+        assert!(hint_text(&ui).contains("Enter 编辑"));
+    }
+
+    #[test]
+    fn wrap_spans_preserves_styles() {
+        // 8 列宽里塞 4 个默认字符 + 4 个加粗字符：应在第 8 列后折成两行
+        let line = Line::from(vec![
+            Span::styled("aaaa", Style::default()),
+            Span::styled("bbbb", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("cc", Style::default().add_modifier(Modifier::BOLD)),
+        ]);
+        let wrapped = wrap_spans(line, 8);
+        assert_eq!(wrapped.len(), 2);
+        // 第二行的 "cc" 仍是加粗（样式不被折行切断）
+        let cc = wrapped[1].spans.iter().find(|s| s.content == "cc").unwrap();
+        assert!(cc.style.add_modifier.contains(Modifier::BOLD));
+        // 折行点字符不丢
+        let all: String = wrapped
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(all, "aaaabbbbcc");
     }
 }

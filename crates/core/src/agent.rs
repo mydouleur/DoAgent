@@ -24,6 +24,8 @@ use crate::workspace::Workspace;
 use serde_json::{json, Value};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 // ToolCall 再导出，外部从 core::ToolCall 拿（经 lib.rs 二次再导出）
@@ -39,6 +41,9 @@ pub enum Cmd {
     Chat(String),
     /// /new：清空历史（第一条用户消息由 TUI 重新注入，通常是 HANDOFF.md）
     Reset,
+    /// Esc：中断当前轮。不走消息队列（actor 正忙时读不到队列），
+    /// 而是直接置位共享的取消标志（见 AgentHandle.cancel）
+    Cancel,
 }
 
 /// agent 推给 TUI 的事件
@@ -66,6 +71,12 @@ pub enum Evt {
 pub struct AgentHandle {
     tx: mpsc::UnboundedSender<Cmd>,
     rx: mpsc::UnboundedReceiver<Evt>,
+    /// 取消标志，TUI 与 agent 各持一份。
+    /// Arc<AtomicBool> ≈ C# volatile bool 的跨线程共享版：
+    /// Arc ≈ 共享引用（≈ C# 对象引用天然共享），AtomicBool 保证并发读写
+    /// 不撕裂。Ordering 用 Relaxed 即可——它是纯标志位，没有"看到 true
+    /// 后还必须看到另一块数据"的依赖关系，不需要更强的内存序。
+    cancel: Arc<AtomicBool>,
 }
 
 impl AgentHandle {
@@ -74,18 +85,33 @@ impl AgentHandle {
         let ws = Workspace::new(root)?;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel::<Evt>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // clone() 克隆的是 Arc（引用计数 +1），两侧指向同一个 AtomicBool
+        let actor_cancel = cancel.clone();
         // `move` 把 ws/cmd_rx/evt_tx 的所有权移进后台任务；
         // tokio::spawn 类似 Task.Run，但要求被捕获的东西满足 Send。
         tokio::spawn(async move {
-            actor_loop(ws, cmd_rx, evt_tx).await;
+            actor_loop(ws, cmd_rx, evt_tx, actor_cancel).await;
         });
-        Ok(AgentHandle { tx: cmd_tx, rx: evt_rx })
+        Ok(AgentHandle { tx: cmd_tx, rx: evt_rx, cancel })
     }
 
     /// 发命令（不阻塞；agent 正忙时消息排队）
     pub fn send(&self, cmd: Cmd) {
-        // 接收端已关闭时 send 会失败——agent 不在了，静默丢弃即可
-        let _ = self.tx.send(cmd);
+        match cmd {
+            // Cancel 走原子标志直接置位——actor 正在 chat_round 里跑，
+            // 读不到命令队列，等它回来再处理就太迟了
+            Cmd::Cancel => self.cancel.store(true, Ordering::Relaxed),
+            // 接收端已关闭时 send 会失败——agent 不在了，静默丢弃即可
+            other => {
+                let _ = self.tx.send(other);
+            }
+        }
+    }
+
+    /// 取消标志当前值（测试与调试用）
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// 等下一个事件（agent 关闭时返回 None，≈ C# 的 await ReceiveAsync）
@@ -101,6 +127,7 @@ async fn actor_loop(
     ws: Workspace,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     evt: mpsc::UnboundedSender<Evt>,
+    cancel: Arc<AtomicBool>,
 ) {
     let defs = tools::defs();
     let mut messages: Vec<Value> = vec![json!({
@@ -115,9 +142,13 @@ async fn actor_loop(
                 let _ = evt.send(Evt::Tokens(estimate_tokens(&messages)));
             }
             Cmd::Chat(text) => {
+                // 新一轮开始前清掉上一轮可能残留的取消标志
+                cancel.store(false, Ordering::Relaxed);
                 messages.push(json!({"role": "user", "content": text}));
-                chat_round(&ws, &defs, &mut messages, &evt).await;
+                chat_round(&ws, &defs, &mut messages, &evt, &cancel).await;
             }
+            // Cancel 在 send 里已直接置位，队列里不会收到；穷尽匹配所需
+            Cmd::Cancel => {}
         }
     }
 }
@@ -128,13 +159,14 @@ async fn chat_round(
     defs: &[tools::ToolDef],
     messages: &mut Vec<Value>,
     evt: &mpsc::UnboundedSender<Evt>,
+    cancel: &AtomicBool,
 ) {
     // 工具往返设上限，防模型死循环
     for _ in 0..16 {
         // 生效配置 = 工作区层 > 全局便携层 > 默认；current_exe 失败自动降级
         let cfg = Config::load_merged(ws.root(), crate::config::exe_dir().as_deref());
         // 回调把流式增量就地转成事件推给 TUI
-        let reply = api::chat(&cfg, messages, defs, |d| {
+        let reply = api::chat(&cfg, messages, defs, cancel, |d| {
             let _ = match d {
                 api::Delta::Text(t) => evt.send(Evt::Text(t)),
                 api::Delta::Reasoning(r) => evt.send(Evt::Reasoning(r)),
@@ -150,6 +182,14 @@ async fn chat_round(
             }
         };
 
+        // SSE 流中途被取消：半截正文保留入历史，本轮就此打住
+        if reply.cancelled {
+            if !reply.content.is_empty() {
+                messages.push(json!({"role": "assistant", "content": reply.content}));
+            }
+            break;
+        }
+
         if reply.tool_calls.is_empty() {
             // 纯文本回复：assistant 消息入列，本轮结束
             messages.push(json!({"role": "assistant", "content": reply.content}));
@@ -160,12 +200,21 @@ async fn chat_round(
         messages.push(assistant_msg(&reply));
         // 顺序执行每个工具，结果以 role=tool 消息入列
         for tc in &reply.tool_calls {
-            let args: Value = serde_json::from_str(&tc.arguments)
-                .unwrap_or_else(|_| json!({}));
-            let result = tools::run(ws, &tc.name, &args).await;
+            // 取消检查点②：每次工具执行前看标志。置位则不执行，
+            // 但仍回填一条 tool 结果——协议要求每个 tool_call 都有应答
+            let result = if cancel.load(Ordering::Relaxed) {
+                "（已取消）".to_string()
+            } else {
+                match check_call(&tc.name, &tc.arguments) {
+                    // 参数校验失败：不执行工具，把明确错误回填给模型
+                    // （自愈原则：模型知道自己错在哪，下一轮会修正）
+                    Err(e) => e,
+                    Ok(args) => tools::run(ws, &tc.name, &args).await,
+                }
+            };
             let _ = evt.send(Evt::Tool {
                 name: tc.name.clone(),
-                args: summarize_args(&args),
+                args: tc.arguments.clone(), // 原始 JSON，展示层决定怎么渲染
                 result: result.clone(),
             });
             messages.push(json!({
@@ -174,10 +223,57 @@ async fn chat_round(
                 "content": result,
             }));
         }
+        // 工具循环期间被取消：结果已回填完毕，不再发起下一轮 API
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         // 继续循环：把工具结果交给模型，等下一步指示
     }
     let _ = evt.send(Evt::Done);
     let _ = evt.send(Evt::Tokens(estimate_tokens(messages)));
+}
+
+/// 派发前校验：解析 arguments + 按各工具的必填/类型规则检查。
+/// 6 个工具的 schema 很简单，手写检查即可，不引 JSON Schema 库。
+/// 返回 Ok(解析后的参数) 或 Err(给模型看的错误文案)。
+fn check_call(name: &str, raw_args: &str) -> Result<Value, String> {
+    let args: Value = serde_json::from_str(raw_args)
+        .map_err(|_| "参数校验失败：arguments 不是合法 JSON".to_string())?;
+    // 必填 string 字段检查
+    let need = |key: &str| -> Result<(), String> {
+        match args.get(key) {
+            Some(v) if v.is_string() => Ok(()),
+            Some(_) => Err(format!("参数校验失败：{key} 应为 string")),
+            None => Err(format!("参数校验失败：缺少必填参数 {key}")),
+        }
+    };
+    // 可选 string 字段：出现就必须是 string
+    let opt = |key: &str| -> Result<(), String> {
+        match args.get(key) {
+            Some(v) if !v.is_string() => Err(format!("参数校验失败：{key} 应为 string")),
+            _ => Ok(()),
+        }
+    };
+    match name {
+        "read" => need("path")?,
+        "write" => {
+            need("path")?;
+            need("content")?;
+        }
+        "edit" => {
+            need("path")?;
+            need("old")?;
+            need("new")?;
+        }
+        "ls" => opt("path")?,
+        "grep" => {
+            need("pattern")?;
+            opt("path")?;
+        }
+        "start" => {}
+        other => return Err(format!("未知工具 {other}")),
+    }
+    Ok(args)
 }
 
 /// 把模型的 tool_calls 序列化成 assistant 历史消息（OpenAI 协议格式）
@@ -200,14 +296,6 @@ fn assistant_msg(reply: &Reply) -> Value {
     })
 }
 
-/// 工具调用的单行摘要（TUI 折叠态显示用），如 `read(src/main.rs)`
-fn summarize_args(args: &Value) -> String {
-    args.get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
 /// 上下文 token 粗估：全部消息序列化后 chars/4。
 /// 程序员看着这个数字自己决定何时 /new——这是设计，不是偷懒。
 fn estimate_tokens(messages: &[Value]) -> usize {
@@ -216,4 +304,43 @@ fn estimate_tokens(messages: &[Value]) -> usize {
         .map(|m| m.to_string().len())
         .sum();
     chars / 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_call_validation() {
+        // 缺必填参数 → 明确错误（回填给模型自愈）
+        let e = check_call("read", "{}").unwrap_err();
+        assert!(e.contains("缺少必填参数 path"), "{e}");
+        // 类型错
+        let e = check_call("read", "{\"path\":1}").unwrap_err();
+        assert!(e.contains("应为 string"), "{e}");
+        // 非法 JSON（旧的静默降级为 {} 已移除）
+        let e = check_call("read", "{oops").unwrap_err();
+        assert!(e.contains("不是合法 JSON"), "{e}");
+        // 正常参数不受影响
+        assert!(check_call("read", "{\"path\":\"a.rs\"}").is_ok());
+        // grep：pattern 必填、path 可选
+        assert!(check_call("grep", "{\"pattern\":\"x\"}").is_ok());
+        assert!(check_call("grep", "{}").is_err());
+        assert!(check_call("grep", "{\"pattern\":\"x\",\"path\":2}").is_err());
+        // start 无参；未知工具直接拒绝
+        assert!(check_call("start", "{}").is_ok());
+        assert!(check_call("bogus", "{}").unwrap_err().contains("未知工具"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_cmd_sets_shared_flag() {
+        let dir = std::env::temp_dir().join(format!("doagent-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = AgentHandle::start(&dir).unwrap();
+        assert!(!h.cancelled());
+        h.send(Cmd::Cancel);
+        assert!(h.cancelled()); // 置位立即对 TUI 侧可见（Arc 共享同一原子量）
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
