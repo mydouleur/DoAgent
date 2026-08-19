@@ -32,7 +32,7 @@ DoAgent subtracts — a fixed set of 7 tools, no free shell, no git, nothing "cl
 It helps you write code. **Control stays with you.**
 
 - **Featherweight**: a single static binary, ~2–3 MB, millisecond cold start
-- **Runs anywhere**: servers, Docker, edge devices — `scp` it over and it works
+- **Runs anywhere**: servers, Docker, edge devices — one curl line and it's installed
 - **Truly portable**: the program and its config live in one folder; uninstall = delete the folder, zero residue
 
 ## Install
