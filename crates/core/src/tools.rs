@@ -324,24 +324,26 @@ fn tool_grep(ws: &Workspace, args: &Value) -> String {
 async fn tool_runcmd(ws: &Workspace, args: &Value) -> String {
     let list = whitelist(ws);
     match args.get("name").and_then(|v| v.as_str()) {
-        // 无参：格式化列出全部（name、命令全文、mode、description）
+        // 无参：格式化列出全部（name、命令全文、mode、来源层、description）
         None => {
             if list.is_empty() {
                 return "当前无已批准命令，可用 addcmd 提案".to_string();
             }
             list.iter()
-                .map(|c| format!("{} = `{}`（{}）{}", c.name, c.command, c.mode, c.description))
+                .map(|(c, src)| {
+                    format!("{} = `{}`（{}·{}）{}", c.name, c.command, c.mode, src, c.description)
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         }
-        Some(n) => match list.iter().find(|c| c.name == n) {
-            Some(c) => run_approved(ws, c).await,
+        Some(n) => match list.iter().find(|(c, _)| c.name == n) {
+            Some((c, _)) => run_approved(ws, c).await,
             // 自愈原则：错误信息附上当前白名单，模型看到可自我纠正
             None => {
                 let names = if list.is_empty() {
                     "（空）".to_string()
                 } else {
-                    list.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                    list.iter().map(|(c, _)| c.name.as_str()).collect::<Vec<_>>().join(", ")
                 };
                 format!("未知命令 {n}，当前已批准：{names}")
             }
@@ -349,19 +351,23 @@ async fn tool_runcmd(ws: &Workspace, args: &Value) -> String {
     }
 }
 
-/// 白名单视图 = `.do/commands.json` + 隐式 start 条目。
-/// start 弃用独立工具后，`/setting start` 配的那条命令并入这里
-/// （只读视图层合并，不落盘 commands.json；白名单里已有 start 则不重复）
-fn whitelist(ws: &Workspace) -> Vec<ApprovedCommand> {
-    let mut cmds = crate::commands::load(ws.root());
+/// 白名单合并视图 = 工作区层 + 全局层（重名工作区赢，带来源标注）
+/// 外加隐式 start 条目（config.start 非空时并入工作区侧，不落盘）。
+/// 全局层文件在 exe 旁、工作区之外，AI 物理不可达。
+fn whitelist(ws: &Workspace) -> Vec<(ApprovedCommand, &'static str)> {
+    let mut cmds = crate::commands::merged(ws.root(), crate::config::exe_dir().as_deref());
     let start = Config::load_workspace(ws.root()).start;
-    if !start.is_empty() && !cmds.iter().any(|c| c.name == "start") {
-        cmds.push(ApprovedCommand {
-            name: "start".into(),
-            command: start,
-            description: "配置的启动/构建命令（/setting start 设置）".into(),
-            mode: "once".into(),
-        });
+    if !start.is_empty() && !cmds.iter().any(|(c, _)| c.name == "start") {
+        cmds.push((
+            ApprovedCommand {
+                name: "start".into(),
+                command: start,
+                description: "配置的启动/构建命令（/setting start 设置）".into(),
+                mode: "once".into(),
+                global: false,
+            },
+            "工作区",
+        ));
     }
     cmds
 }
@@ -539,12 +545,14 @@ mod tests {
                 command: "echo hello-from-cmd".into(),
                 description: "测试用一次性命令".into(),
                 mode: "once".into(),
+                global: false,
             },
             ApprovedCommand {
                 name: "srv".into(),
                 command: "echo hi".into(),
                 description: "测试用常驻命令".into(),
                 mode: "daemon".into(),
+                global: false,
             },
         ]
     }
@@ -572,7 +580,7 @@ mod tests {
         // 落盘后列出：name/命令全文/mode 都在
         crate::commands::save(&dir, &sample_cmds()).unwrap();
         let out = run(&ws, "runcmd", &json!({})).await;
-        assert!(out.contains("hello = `echo hello-from-cmd`（once）"), "{out}");
+        assert!(out.contains("hello = `echo hello-from-cmd`（once·工作区）"), "{out}");
         assert!(out.contains("srv"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -612,7 +620,7 @@ mod tests {
         cfg.set("start", "echo implicit-start").unwrap();
         cfg.save(&dir).unwrap();
         let out = run(&ws, "runcmd", &json!({})).await;
-        assert!(out.contains("start = `echo implicit-start`（once）"), "{out}");
+        assert!(out.contains("start = `echo implicit-start`（once·工作区）"), "{out}");
         let out = run(&ws, "runcmd", &json!({"name": "start"})).await;
         assert!(out.contains("implicit-start"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);

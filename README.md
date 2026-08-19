@@ -78,7 +78,7 @@ Then just talk: "check the error in src/main.rs".
 | Input | Action |
 |---|---|
 | `/setting [-g] <url\|key\|model\|start> <value>` | change config (`-g` writes the global layer) |
-| `/new` | new conversation (auto-resumes from HANDOFF.md) |
+| `/new` | new conversation (AI re-reads HANDOFF.md itself) |
 | `/addcmd <name 命令>` | self-register a whitelisted command (confirms in the approval page) |
 | `/allowcmd` / `/deletecmd [name]` | approve AI proposals / revoke whitelisted commands |
 | `/quit` or `Ctrl+C` | exit |
@@ -92,6 +92,12 @@ Then just talk: "check the error in src/main.rs".
 | Workspace (wins) | `project/.do/config.json` | `start` + per-project overrides |
 | Global (portable) | `do.config.json` next to the binary | `url` / `key` / `model` |
 
+The command whitelist is two-layered the same way: `do.commands.json` next to the binary (global, `/addcmd -g`) plus `project/.do/commands.json` (workspace wins on name clashes). `runcmd` lists both with a source tag. AI proposals always land in the workspace layer — the AI can never grant itself a cross-project command.
+
+## Audit
+
+Every session appends to `do.audit.jsonl` next to the binary — one JSON record per line: user inputs, tool calls (name, args, duration, result tail), and per-round token estimates. It lives **outside** the workspace on purpose: the AI's tools are locked to the workspace root, so it cannot forge or erase its own track record. If the file isn't writable the audit silently disables itself (with a one-line notice at startup).
+
 Set your identity once globally; each project only needs its `start` command.
 Need a different key for one project? `/setting key ...` (no `-g`) overrides it there.
 
@@ -99,7 +105,7 @@ Need a different key for one project? `/setting key ...` (no `-g`) overrides it 
 
 No black-box auto-summaries. The AI is instructed to maintain a `HANDOFF.md` (goal / progress / decisions / next step).
 Watch the token estimate in the status bar; when you decide it's time, `/new` —
-history clears, and the handoff doc becomes the first message of the new conversation. **You decide when to compact.**
+history clears, and the AI re-reads the handoff doc on its own. **You decide when to compact.**
 
 ## Uninstall
 

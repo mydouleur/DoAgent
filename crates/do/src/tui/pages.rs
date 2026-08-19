@@ -39,11 +39,45 @@ fn mask_key(key: &str) -> String {
 
 /// slash 命令候选表：命令名 + 用法提示（渲染在状态栏上方的提示行）
 /// 数组 + 切片 ≈ C# 的静态只读表；零分配、零组件，够用就好。
+// logo 配色：实心方块 █ = #ff006e（品红），点状方块 ░ = #ccff00（荧光绿）
+const SOLID: Color = Color::Rgb(0xcc, 0xff, 0x00);
+const DOTTED: Color = Color::Rgb(0xff, 0x00, 0x6e);
+
+/// 把一行 logo 文本变成逐段着色的 Line。
+/// ratatui 的 Line = Span 序列 ≈ C# 里 RichTextBox 的一串 Run：
+/// 每段文字各带样式。连续同色字符合并成一个 Span，少分配。
+fn logo_line(l: &str) -> Line<'static> {
+    let color_of = |c: char| match c {
+        '█' => Some(SOLID),
+        '░' => Some(DOTTED),
+        _ => None, // 空格等：默认色
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_color: Option<Color> = None;
+    for c in l.chars() {
+        if color_of(c) != cur_color {
+            if !cur.is_empty() {
+                spans.push(match cur_color {
+                    Some(col) => Span::styled(std::mem::take(&mut cur), Style::default().fg(col)),
+                    None => Span::raw(std::mem::take(&mut cur)),
+                });
+            }
+            cur_color = color_of(c);
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        spans.push(match cur_color {
+            Some(col) => Span::styled(cur, Style::default().fg(col)),
+            None => Span::raw(cur),
+        });
+    }
+    Line::from(spans)
+}
+
 pub(super) fn draw_splash(frame: &mut Frame, area: Rect, ui: &Ui) {
-    let mut lines: Vec<Line> = LOGO
-        .lines()
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Cyan))))
-        .collect();
+    let mut lines: Vec<Line> = LOGO.lines().map(logo_line).collect();
     lines.push(Line::from(""));
     lines.push(Line::from(format!("DoAgent v{}", env!("CARGO_PKG_VERSION"))));
     lines.push(Line::from(format!("工作区: {}", ui.workspace)));
@@ -143,7 +177,9 @@ pub(super) fn approve_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
         for l in wrap_text(&p.command, width.max(8)) {
             out.push(Line::from(Span::styled(l, Style::default().fg(Color::Yellow))));
         }
-        out.push(Line::from(Span::styled(format!("mode: {}", p.mode), section)));
+        // 目标层：AI 提案恒为工作区层；人类 /addcmd -g 注册的显示全局层
+        let target = if p.global { " · 批准到全局层" } else { "" };
+        out.push(Line::from(Span::styled(format!("mode: {}{target}", p.mode), section)));
         let desc = if p.description.is_empty() { "(无)" } else { &p.description };
         let desc_style = if ui.appr_editing {
             Style::default().fg(Color::Cyan)
@@ -163,7 +199,7 @@ pub(super) fn delete_lines(ui: &Ui) -> Vec<Line<'static>> {
         "已批准命令（Enter 删除即撤销该工具）",
         Style::default().fg(Color::DarkGray),
     )));
-    for (i, c) in ui.del_list.iter().enumerate() {
+    for (i, (c, src)) in ui.del_list.iter().enumerate() {
         let selected = i == ui.del_sel;
         let style = if selected {
             Style::default().fg(Color::Cyan)
@@ -172,11 +208,12 @@ pub(super) fn delete_lines(ui: &Ui) -> Vec<Line<'static>> {
         };
         out.push(Line::from(Span::styled(
             format!(
-                "{} {:<12} = `{}`（{}）",
+                "{} {:<12} = `{}`（{}·{}）",
                 if selected { ">" } else { " " },
                 c.name,
                 c.command,
-                c.mode
+                c.mode,
+                src
             ),
             style,
         )));
@@ -193,6 +230,22 @@ mod tests {
         assert_eq!(mask_key("sk-abcdefghij"), "sk-****ghij");
         assert_eq!(mask_key("short"), "****");
         assert_eq!(mask_key(""), "****");
+    }
+
+    #[test]
+    fn logo_colors_solid_and_dotted() {
+        // 实心方块 #ff006e、点状方块 #ccff00、空格默认色
+        let line = logo_line("░█ ░");
+        let spans: Vec<_> = line.spans.iter().collect();
+        assert_eq!(spans[0].content.as_ref(), "░");
+        assert_eq!(spans[0].style.fg, Some(DOTTED));
+        assert_eq!(spans[1].content.as_ref(), "█");
+        assert_eq!(spans[1].style.fg, Some(SOLID));
+        assert_eq!(spans[2].content.as_ref(), " ");
+        assert_eq!(spans[2].style.fg, None);
+        // 连续同名字符合并：尾部 ░ 与开头 ░ 不同段（中间隔着 █ 和空格）
+        assert_eq!(spans[3].content.as_ref(), "░");
+        assert_eq!(spans[3].style.fg, Some(DOTTED));
     }
 
 }

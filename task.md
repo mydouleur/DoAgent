@@ -47,7 +47,7 @@ tools 数组永远冻结为这 7 个：prompt 缓存按 system + tools + message
 - 注意：tool schema 才是 token 大头，控制工具描述的长度
 - 上下文管理就两条，不做 LLM 自动总结、不做占位化：
   1. 源头截断：所有工具结果返回时掐断（read 限行、grep 限匹配、start 限字节）
-  2. `/new` 即压缩：system prompt 要求 AI 随时在工作区根维护 `HANDOFF.md`（交接文档：当前目标、进展、关键决策、下一步）；`/new` 清空消息历史，并自动把 `HANDOFF.md` 内容作为新对话的第一条用户消息注入 → 上下文天然连带
+  2. `/new` 即压缩：system prompt 要求 AI 随时在工作区根维护 `HANDOFF.md`（交接文档：当前目标、进展、关键决策、下一步）；`/new` 清空消息历史；AI 按 system prompt 要求在新对话开始时自行 read HANDOFF.md 续接（不注入，省 token）→ 上下文天然连带
 - 底部状态栏实时显示上下文 token 估算（chars/4 粗估即可）——程序员要对自己的模型有了解，看着数字自己决定何时 /new
 
 ## 沙盒
@@ -73,7 +73,7 @@ tools 数组永远冻结为这 7 个：prompt 缓存按 system + tools + message
 6. `do` 的 TUI（ratatui）：
    - 启动展示 task.md 末尾的 ASCII logo（逐字内嵌）
    - 对话流；思考过程（reasoning）与工具调用可折叠显示，不同颜色区分（思考灰、工具青、正文默认色），折叠块可展开/收起，布局随终端宽度自适应拉伸
-   - `/setting` 修改 url/key/model/start（写 `.do/config.json`）；`/new` 清历史并注入 `HANDOFF.md`
+   - `/setting` 修改 url/key/model/start（写 `.do/config.json`）；`/new` 清历史（不注入，AI 自读 HANDOFF.md）
    - 底部状态栏：上下文 token 估算 + 当前模型
 7. 压缩 system prompt 到 200 token 内（含维护 HANDOFF.md 的指令）
 8. 教学级注释贯穿全代码（见技术栈）；build + test 全绿后实测 do.exe 体积
@@ -94,7 +94,9 @@ tools 数组永远冻结为这 7 个：prompt 缓存按 system + tools + message
 - **v0.2 批次（待思考 1-7）**：Markdown 全量渲染（pulldown-cmark，+194 KB）；思考流式可见/正文开始自动折叠；启动 splash；/setting 独立设置页（key 掩码）；工具调用函数样式 `read("src/main.rs")`；Esc 取消；参数校验失败回填模型自愈
 - **待思考 8（命令白名单）**：AI 用 `addcmd` 工具提案、人类 `/allowcmd` 审批（列表视图）/ `/deletecmd` 撤销、人类也可 `/addcmd <name> <命令>` 自助注册；批准落盘 `.do/commands.json`（对 AI 隐形）；**发现式注入**——tools 数组冻结为固定 7 个（read/write/edit/ls/grep/addcmd/runcmd），白名单经 `runcmd` 列出与执行，批准动作零缓存代价；start 独立工具弃用（config.start 并入白名单视图）
 - **待办 1-6 批次**：①/setting 页显示 bug 修复——设置页改显示合并生效值并标注来源层（工作区/全局/默认），保存仍按"写哪层只写哪层"；②start 残留清理（tools/lib/config 文档与截断说明统一为 runcmd）；③splash 自动跳过修复——select! 条件定时分支改 tick 心跳（crossterm poll 100ms + 截止时间判断，纯函数可测；后改为 splash 仅按键进入，tick 只驱动 doing 动画帧）；④工具调用即时显示——新增 `Evt::ToolStart`，派发即插入进行中块，结果到来按序更新，取消时遗留块标"（已取消）"；状态字 doing（黄、500ms 点号动画）/ done（绿）/ 已取消（红）分色；⑤TLS 平台分叉——Windows/macOS/gnu 用 native-tls（Schannel/Security.framework/系统 OpenSSL），musl 保留 rustls，新增 `do --check-net <url>` 冒烟入口，CI 每个构建 job 跑 HTTPS 冒烟；Windows 体积 2.78 → 1.95 MB；⑥CI 矩阵加 macOS（aarch64 + x86_64），README 补 Gatekeeper 与各平台 TLS 来源说明，tui.rs 拆为 tui/{mod,pages,forms}（纯结构搬迁）
+- **全局命令层 + JSONL 审计日志**：白名单双层化——全局层 `do.commands.json`（exe 旁，AI 物理不可达），runcmd 名单 = 工作区 + 全局合并视图（重名工作区赢、列表带来源标注）；`/addcmd -g` 人类注册到全局层，**AI 提案批准恒落工作区层**（AI 不能获得跨项目命令，安全边界）；`/deletecmd` 两层都查、同名删工作区层并提示。审计日志 `do.audit.jsonl`（exe 旁）记 input/tool/reply 三类（tool 含 duration_ms、result 尾 200 字符）——选 JSONL 不选 SQLite 是体积账（2 MB 级 vs 5 MB 级）；放工作区外 = AI 无法伪造/擦除自己的操作记录；写失败静默降级，启动时不可写给 Info
 
 ## 待办（之后处理，现在不动手）
 
-（空）
+1. ~~**doing 空括号根治：宽容解析主参数**~~ ✅ 实验否决：用 Kimi Code 写长文实测——主流 agent 流式中段**什么都不显示**（仅 processing），工具名要到执行时才出现；DoAgent 的"name 首现即宣告 + doing 动画 + 完成翻函数样式"已领先主流。空括号是"提前告知"的合理代价，宽容提取不做，现状即终态
+2. **try.cmd 中文注释已改英文**（cmd.exe 按 GBK 解析、不认 UTF-8 无 BOM）——已完成，此处仅备忘

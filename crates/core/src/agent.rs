@@ -34,7 +34,7 @@ pub use crate::api::ToolCall;
 
 /// system prompt：控制在 200 token 内（约 300 字内）。
 /// 一句话角色 + 工具纪律 + 维护 HANDOFF.md 的义务。
-pub const SYSTEM_PROMPT: &str = "你是 DoAgent，嵌入式编程副驾驶。用内建工具(read/write/edit/ls/grep)读写代码；已批准的固定命令用 runcmd 列出与执行，需要新命令用 addcmd 提案（人类批准后生效）；无自由 shell。改完代码用 runcmd 跑构建命令拿反馈。随时在工作区根维护 HANDOFF.md（当前目标/进展/关键决策/下一步），有进展就更新。回答简洁，直接行动。";
+pub const SYSTEM_PROMPT: &str = "你是 DoAgent，极简编程助手。用内建工具(read/write/edit/ls/grep)读写代码；已批准的固定命令用 runcmd 列出与执行，需要新命令用 addcmd 提案（人类批准后生效）；无自由 shell。改完代码用 runcmd 跑构建命令拿反馈。随时在工作区根维护 HANDOFF.md（当前目标/进展/关键决策/下一步），有进展就更新；新对话开始时若存在 HANDOFF.md 先用 read 读取续接。回答简洁，直接行动。";
 
 /// TUI 发给 agent 的命令
 pub enum Cmd {
@@ -142,6 +142,8 @@ async fn actor_loop(
         "role": "system",
         "content": SYSTEM_PROMPT,
     })];
+    // 审计日志（exe 旁 do.audit.jsonl）；不可写时整体降级关闭
+    let mut audit = crate::audit::Audit::new(ws.root());
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -150,10 +152,12 @@ async fn actor_loop(
                 let _ = evt.send(Evt::Tokens(estimate_tokens(&messages)));
             }
             Cmd::Chat(text) => {
+                // 审计：用户输入（在 core 统一记录，TUI 不插手）
+                audit.log("input", json!({ "text": text }));
                 // 新一轮开始前清掉上一轮可能残留的取消标志
                 cancel.store(false, Ordering::Relaxed);
                 messages.push(json!({"role": "user", "content": text}));
-                chat_round(&ws, &defs, &mut messages, &evt, &cancel).await;
+                chat_round(&ws, &defs, &mut messages, &evt, &cancel, &mut audit).await;
             }
             // 系统通知（如"命令已获批准"）：以 user 角色注入历史，不触发 API
             Cmd::Notify(text) => {
@@ -179,6 +183,7 @@ async fn chat_round(
     messages: &mut Vec<Value>,
     evt: &mpsc::UnboundedSender<Evt>,
     cancel: &AtomicBool,
+    audit: &mut crate::audit::Audit,
 ) {
     // 工具往返设上限，防模型死循环
     for _ in 0..16 {
@@ -229,38 +234,61 @@ async fn chat_round(
         for (call_idx, tc) in reply.tool_calls.iter().enumerate() {
             // 取消检查点②：每次工具执行前看标志。置位则不执行，
             // 但仍回填一条 tool 结果——协议要求每个 tool_call 都有应答
-            let result = if cancel.load(Ordering::Relaxed) {
-                "（已取消）".to_string()
-            } else {
-                // 派发前先发 ToolStart：TUI 立即显示进行中块，不等结果。
-                // 流式中段已通过 ToolBegin 宣告过的不再重发（判重）
-                if !announced.contains(&call_idx) {
-                    let _ = evt.send(Evt::ToolStart {
-                        name: tc.name.clone(),
-                        args: tc.arguments.clone(),
-                    });
-                }
-                match check_call(&tc.name, &tc.arguments) {
-                    // 参数校验失败：不执行工具，把明确错误回填给模型
-                    // （自愈原则：模型知道自己错在哪，下一轮会修正）
-                    Err(e) => e,
-                    Ok(args) => {
-                        if tc.name == "addcmd" {
-                            // 提案不执行任何东西：推给 TUI 等人类审批
-                            let p = ApprovedCommand {
-                                name: args["name"].as_str().unwrap_or_default().to_string(),
-                                command: args["command"].as_str().unwrap_or_default().to_string(),
-                                description: args["description"].as_str().unwrap_or_default().to_string(),
-                                mode: args["mode"].as_str().unwrap_or_default().to_string(),
-                            };
-                            let _ = evt.send(Evt::Proposal(p));
-                            "已提交人类审批，结果待人工确认".to_string()
-                        } else {
-                            tools::run(ws, &tc.name, &args).await
-                        }
+            if cancel.load(Ordering::Relaxed) {
+                let _ = evt.send(Evt::Tool {
+                    name: tc.name.clone(),
+                    args: tc.arguments.clone(),
+                    result: "（已取消）".to_string(),
+                });
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": "（已取消）",
+                }));
+                continue;
+            }
+            // 派发前先发 ToolStart：TUI 立即显示进行中块，不等结果。
+            // 流式中段已通过 ToolBegin 宣告过的不再重发（判重）
+            if !announced.contains(&call_idx) {
+                let _ = evt.send(Evt::ToolStart {
+                    name: tc.name.clone(),
+                    args: tc.arguments.clone(),
+                });
+            }
+            let t0 = std::time::Instant::now();
+            let result = match check_call(&tc.name, &tc.arguments) {
+                // 参数校验失败：不执行工具，把明确错误回填给模型
+                // （自愈原则：模型知道自己错在哪，下一轮会修正）
+                Err(e) => e,
+                Ok(args) => {
+                    if tc.name == "addcmd" {
+                        // 提案不执行任何东西：推给 TUI 等人类审批
+                        let p = ApprovedCommand {
+                            name: args["name"].as_str().unwrap_or_default().to_string(),
+                            command: args["command"].as_str().unwrap_or_default().to_string(),
+                            description: args["description"].as_str().unwrap_or_default().to_string(),
+                            mode: args["mode"].as_str().unwrap_or_default().to_string(),
+                            // AI 提案永远只去工作区层——AI 不能获得跨项目
+                            // 生效的命令（安全边界，审批落盘时再次强制）
+                            global: false,
+                        };
+                        let _ = evt.send(Evt::Proposal(p));
+                        "已提交人类审批，结果待人工确认".to_string()
+                    } else {
+                        tools::run(ws, &tc.name, &args).await
                     }
                 }
             };
+            // 审计：工具执行（result 只留尾部 200 字符，防日志膨胀）
+            audit.log(
+                "tool",
+                json!({
+                    "name": tc.name,
+                    "args": tc.arguments,
+                    "duration_ms": t0.elapsed().as_millis(),
+                    "result": tail_chars(&result, 200),
+                }),
+            );
             let _ = evt.send(Evt::Tool {
                 name: tc.name.clone(),
                 args: tc.arguments.clone(), // 原始 JSON，展示层决定怎么渲染
@@ -279,7 +307,16 @@ async fn chat_round(
         // 继续循环：把工具结果交给模型，等下一步指示
     }
     let _ = evt.send(Evt::Done);
-    let _ = evt.send(Evt::Tokens(estimate_tokens(messages)));
+    let tokens = estimate_tokens(messages);
+    // 审计：一轮对话完成（粗估 token 即可）
+    audit.log("reply", json!({ "tokens": tokens }));
+    let _ = evt.send(Evt::Tokens(tokens));
+}
+
+/// 取字符串尾部 n 个字符（审计 result 截断用，按 char 不切 UTF-8）
+fn tail_chars(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    chars.iter().skip(chars.len().saturating_sub(n)).collect()
 }
 
 /// 派发前校验：解析 arguments + 按各工具的必填/类型规则检查。

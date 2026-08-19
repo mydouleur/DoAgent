@@ -131,7 +131,8 @@ struct Ui {
     appr_editing: bool,
     appr_desc_backup: String,
     /// 删除页：进入时载入的已批准命令列表与选中下标
-    del_list: Vec<ApprovedCommand>,
+    /// 删除页：进入时载入的合并视图（命令 + 来源层标注）与选中下标
+    del_list: Vec<(ApprovedCommand, &'static str)>,
     del_sel: usize,
     /// Tick 心跳计数（100ms 一次）：驱动工具调用 doing 动画帧
     tick_count: u64,
@@ -224,6 +225,10 @@ pub async fn run(root: &Path) -> io::Result<()> {
     }
     if !ui.has_key {
         ui.items.push(Item::Info("未设置 API key，请用 /setting -g key <你的key>".into()));
+    }
+    // 审计可用性检查：不可写只是降级，但用户应当知道
+    if !agent_core::audit::Audit::new(root).enabled() {
+        ui.items.push(Item::Info("审计日志不可写，已关闭（do.audit.jsonl）".into()));
     }
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -436,15 +441,24 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
         // /addcmd：仅人类自助注册（name 与命令全文必填）。
         // 注册后仍开审批页确认——保持"落盘前必有确认"的不变量
         "addcmd" => {
-            let mut kv = arg.splitn(2, char::is_whitespace);
+            // `-g` 前缀注册到全局层（exe 旁 do.commands.json），与 /setting -g 同构
+            let (global, rest) = match arg.strip_prefix("-g") {
+                Some(r) => (true, r.trim()),
+                None => (false, arg),
+            };
+            let mut kv = rest.splitn(2, char::is_whitespace);
             let name = kv.next().unwrap_or("");
             let command = kv.next().unwrap_or("").trim();
             if name.is_empty() || command.is_empty() {
-                ui.items.push(Item::Info("用法: /addcmd <name> <命令全文>".into()));
+                ui.items.push(Item::Info("用法: /addcmd [-g] <name> <命令全文>".into()));
                 return;
             }
             if !agent_core::commands::valid_name(name) {
                 ui.items.push(Item::Info("name 只能包含字母/数字/_/-".into()));
+                return;
+            }
+            if global && agent_core::config::exe_dir().is_none() {
+                ui.items.push(Item::Info("无法定位 do.exe 目录，全局层不可用".into()));
                 return;
             }
             ui.pending.push(ApprovedCommand {
@@ -452,6 +466,7 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                 command: command.to_string(),
                 description: String::new(), // desc 默认空，审批页可按 e 补
                 mode: "once".into(),        // 自助注册默认一次性
+                global,
             });
             // 选中刚注册的这条（队尾）
             ui.appr_sel = ui.pending.len() - 1;
@@ -469,9 +484,13 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
             }
         }
         // /deletecmd：带名字直接删；不带则进入删除页
+        // /deletecmd：带名字直接删（先查工作区层再查全局层）；不带则进入删除页
         "deletecmd" => {
             if arg.is_empty() {
-                let cmds = agent_core::commands::load(root);
+                let cmds = agent_core::commands::merged(
+                    root,
+                    agent_core::config::exe_dir().as_deref(),
+                );
                 if cmds.is_empty() {
                     ui.items.push(Item::Info("无已批准命令".into()));
                 } else {
@@ -480,35 +499,52 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                     ui.mode = Mode::Delete;
                 }
             } else {
-                let mut cmds = agent_core::commands::load(root);
-                let before = cmds.len();
-                cmds.retain(|c| c.name != arg);
-                if cmds.len() == before {
+                // 先查工作区层
+                let mut ws_cmds = agent_core::commands::load(root);
+                let before = ws_cmds.len();
+                ws_cmds.retain(|c| c.name != arg);
+                if ws_cmds.len() != before {
+                    match agent_core::commands::save(root, &ws_cmds) {
+                        Ok(()) => {
+                            // 两层同名：删工作区层，提示全局层还有一条
+                            let g_has = agent_core::config::exe_dir()
+                                .map(|d| agent_core::commands::load_global(&d))
+                                .unwrap_or_default()
+                                .iter()
+                                .any(|c| c.name == arg);
+                            let extra = if g_has { "（全局层还有一条同名）" } else { "" };
+                            ui.items.push(Item::Info(format!("已撤销: {arg}{extra}")));
+                        }
+                        Err(e) => ui.items.push(Item::Info(e.to_string())),
+                    }
+                    return;
+                }
+                // 再查全局层
+                let Some(dir) = agent_core::config::exe_dir() else {
+                    ui.items.push(Item::Info(format!("未找到已批准命令: {arg}")));
+                    return;
+                };
+                let mut g_cmds = agent_core::commands::load_global(&dir);
+                let before = g_cmds.len();
+                g_cmds.retain(|c| c.name != arg);
+                if g_cmds.len() == before {
                     ui.items.push(Item::Info(format!("未找到已批准命令: {arg}")));
                 } else {
-                    match agent_core::commands::save(root, &cmds) {
-                        Ok(()) => ui.items.push(Item::Info(format!("已撤销: {arg}"))),
+                    match agent_core::commands::save_global(&dir, &g_cmds) {
+                        Ok(()) => ui.items.push(Item::Info(format!("已撤销 全局: {arg}"))),
                         Err(e) => ui.items.push(Item::Info(e.to_string())),
                     }
                 }
             }
         }
         "new" => {
-            // /new 即压缩：清历史，把 HANDOFF.md 作为第一条用户消息注入
+            // /new 即压缩：只清历史。不做 HANDOFF.md 注入——system prompt
+            // 已要求 AI 新对话开始时自行 read 续接（它在工作区里、有工具可达），
+            // 注入只是替它读一遍，白费 token
             agent.send(Cmd::Reset);
             ui.items.clear();
             ui.tokens = 0;
-            match std::fs::read_to_string(root.join("HANDOFF.md")) {
-                Ok(h) if !h.trim().is_empty() => {
-                    let msg = format!("交接文档 HANDOFF.md 内容如下：\n{h}");
-                    ui.items.push(Item::User(msg.clone()));
-                    if ui.has_key {
-                        ui.busy = true;
-                        agent.send(Cmd::Chat(msg));
-                    }
-                }
-                _ => ui.items.push(Item::Info("已清空上下文（无 HANDOFF.md 可注入）".into())),
-            }
+            ui.items.push(Item::Info("已开始新对话（AI 将自行读取 HANDOFF.md 续接）".into()));
         }
         // 裸 /setting（无参数）→ 进入独立设置页
         "setting" if arg.is_empty() => enter_settings(ui, root),
@@ -1085,6 +1121,7 @@ mod tests {
                 command: "npm run dev".into(),
                 description: "开发服务器".into(),
                 mode: "daemon".into(),
+                global: false,
             }),
         );
         assert_eq!(ui.pending.len(), 1);

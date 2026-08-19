@@ -6,6 +6,8 @@
 //! - [`tools`]     7 个 AI 工具（read/write/edit/ls/grep/addcmd/runcmd，数组冻结）
 //! - [`api`]       OpenAI 兼容 API 的 SSE 流式客户端 + tool_calls 累加器
 //! - [`config`]    `.do/config.json` 的读写
+//! - [`commands`]  命令白名单（工作区 + 全局双层）
+//! - [`audit`]     全局审计日志（do.audit.jsonl，exe 旁）
 //! - [`agent`]     agent 对话循环（actor 模式：消息进、事件出）
 //!
 //! # 对外的最小公共 API
@@ -15,7 +17,8 @@
 
 mod agent;
 mod api;
-pub mod commands; // pub：TUI 的 /addcmd /deletecmd 与测试复用
+pub mod audit; // pub：TUI 启动时做可用性检查
+pub mod commands; // pub：TUI 的 /addcmd /allowcmd /deletecmd 与测试复用
 pub mod config; // pub 给集成测试复用
 mod tools;
 pub mod workspace; // pub 给集成测试复用

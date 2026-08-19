@@ -99,7 +99,10 @@ pub(super) fn approve_key(ui: &mut Ui, code: KeyCode, agent: &mut AgentHandle, r
     }
 }
 
-/// 批准选中提案：command 原样（含就地编辑过的 desc）写入 .do/commands.json
+/// 批准选中提案：command 原样（含就地编辑过的 desc）落盘到目标层。
+/// 目标层由提案的 global 标记决定：只有人类 /addcmd -g 能置位；
+/// AI 提案（addcmd 工具）永远是工作区层——AI 不能获得跨项目生效的命令，
+/// 这是一条安全边界（构造提案时硬编码 false，这里不再提供改写途径）。
 fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
     let Some(p) = ui.pending.get(ui.appr_sel).cloned() else {
         ui.mode = Mode::Chat;
@@ -111,18 +114,38 @@ fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
         ui.items.push(Item::Info("name 只能包含字母/数字/_/-".into()));
         return;
     }
-    // 与内建工具或已批准命令重名 = 拒绝（覆盖已有工具太危险）。
+    // 选定目标层：读该层名单
+    let target_dir = if p.global {
+        match agent_core::config::exe_dir() {
+            Some(d) => Some(d),
+            None => {
+                ui.items.push(Item::Info("无法定位 do.exe 目录，全局层不可用".into()));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let mut cmds = match &target_dir {
+        Some(d) => agent_core::commands::load_global(d),
+        None => agent_core::commands::load(root),
+    };
+    // 与内建工具或同层已批准命令重名 = 拒绝（覆盖已有工具太危险）。
     // start 是隐式保留名（白名单视图会合并 config.start），一并保护
     const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "addcmd", "runcmd", "start"];
-    let mut cmds = agent_core::commands::load(root);
     if BUILTIN.contains(&name.as_str()) || cmds.iter().any(|c| c.name == name) {
         ui.items.push(Item::Info(format!("name 冲突：{name} 已被占用")));
         return;
     }
-    cmds.push(p);
-    match agent_core::commands::save(root, &cmds) {
+    cmds.push(p.clone());
+    let save_result = match &target_dir {
+        Some(d) => agent_core::commands::save_global(d, &cmds),
+        None => agent_core::commands::save(root, &cmds),
+    };
+    match save_result {
         Ok(()) => {
-            ui.items.push(Item::Info(format!("已批准并注册: {name}")));
+            let layer = if p.global { " 全局" } else { "" };
+            ui.items.push(Item::Info(format!("已批准并注册{layer}: {name}")));
             ui.pending.remove(ui.appr_sel);
             // 批准后通知模型：以 user 角色注入历史（不触发 API）。
             // tools 数组是冻结的，批准不改变 prompt 前缀——零缓存代价
@@ -156,7 +179,7 @@ fn after_proposal_removed(ui: &mut Ui) {
     }
 }
 
-/// Delete 模式的按键：↑↓ 选择、Enter 删除、Esc 返回
+/// Delete 模式的按键：↑↓ 选择、Enter 删除（按来源层落盘）、Esc 返回
 pub(super) fn delete_key(ui: &mut Ui, code: KeyCode, root: &Path) {
     match code {
         KeyCode::Up => ui.del_sel = ui.del_sel.saturating_sub(1),
@@ -167,10 +190,26 @@ pub(super) fn delete_key(ui: &mut Ui, code: KeyCode, root: &Path) {
         }
         KeyCode::Enter => {
             if ui.del_sel < ui.del_list.len() {
-                let gone = ui.del_list.remove(ui.del_sel);
-                match agent_core::commands::save(root, &ui.del_list) {
-                    Ok(()) => ui.items.push(Item::Info(format!("已撤销: {}", gone.name))),
-                    Err(e) => ui.items.push(Item::Info(e.to_string())),
+                let (gone, src) = ui.del_list.remove(ui.del_sel);
+                // 按来源层删：读该层名单、retain、写回
+                let result = if src == "全局" {
+                    agent_core::config::exe_dir().map(|d| {
+                        let mut cmds = agent_core::commands::load_global(&d);
+                        cmds.retain(|c| c.name != gone.name);
+                        agent_core::commands::save_global(&d, &cmds)
+                    })
+                } else {
+                    let mut cmds = agent_core::commands::load(root);
+                    cmds.retain(|c| c.name != gone.name);
+                    Some(agent_core::commands::save(root, &cmds))
+                };
+                match result {
+                    Some(Ok(())) => {
+                        let layer = if src == "全局" { " 全局" } else { "" };
+                        ui.items.push(Item::Info(format!("已撤销{layer}: {}", gone.name)));
+                    }
+                    Some(Err(e)) => ui.items.push(Item::Info(e.to_string())),
+                    None => ui.items.push(Item::Info("无法定位 do.exe 目录".into())),
                 }
                 ui.del_sel = ui.del_sel.min(ui.del_list.len().saturating_sub(1));
                 if ui.del_list.is_empty() {
@@ -274,6 +313,26 @@ mod tests {
     use crate::tui::pages::approve_lines;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn addcmd_g_marks_global_target() {
+        let dir = std::env::temp_dir().join(format!("doagent-tuig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut agent = AgentHandle::start(&dir).unwrap();
+        let mut ui = test_ui();
+        // -g：目标层标记为全局（批准时才落盘，此处只验证分流标记）
+        slash(&mut ui, &mut agent, &dir, "addcmd -g deploy cargo build --release");
+        assert_eq!(ui.pending.len(), 1);
+        assert!(ui.pending[0].global);
+        assert_eq!(ui.pending[0].name, "deploy");
+        assert_eq!(ui.pending[0].command, "cargo build --release");
+        assert_eq!(ui.mode, Mode::Approve);
+        // 不带 -g：工作区层
+        slash(&mut ui, &mut agent, &dir, "addcmd local echo x");
+        assert!(!ui.pending[1].global);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn addcmd_self_register_and_desc_editing() {
         let dir = std::env::temp_dir().join(format!("doagent-tui2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -326,6 +385,7 @@ mod tests {
                 command: format!("echo {n}"),
                 description: d.into(),
                 mode: "once".into(),
+                global: false,
             });
         }
         slash(&mut ui, &mut agent, &dir, "allowcmd");
@@ -374,6 +434,7 @@ mod tests {
             command: "echo keep".into(),
             description: String::new(),
             mode: "once".into(),
+            global: false,
         });
         slash(&mut ui, &mut agent, &dir, "allowcmd");
         assert_eq!(ui.mode, Mode::Approve);

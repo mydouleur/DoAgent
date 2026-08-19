@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
 
+/// 全局层文件名（exe 同目录，与 do.config.json 并排）
+pub const GLOBAL_FILE: &str = "do.commands.json";
+
 /// 一条已批准（或待批准）的固定命令。
 /// 提案与落盘共用同一结构——审批通过 = 原样写入，不改一个字。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +33,10 @@ pub struct ApprovedCommand {
     /// `once` = 一次性（等结束、返回输出尾部）；
     /// `daemon` = 常驻（后台 spawn 立即返回）
     pub mode: String,
+    /// 待批期间的目标层标记：true = 批准到全局层（/addcmd -g）。
+    /// `#[serde(skip)]`：不进落盘 JSON——层归属由文件位置表达，不入数据
+    #[serde(skip)]
+    pub global: bool,
 }
 
 /// name 合法性：`^[a-zA-Z0-9_-]+$`。
@@ -42,7 +49,7 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// 读批准列表；文件不存在/损坏 → 空列表（"没批准过任何命令"是合法状态）。
+/// 读工作区层批准列表；文件不存在/损坏 → 空列表。
 /// 这是 core 自己人通道：直接读 `.do/`，不过 workspace 守卫。
 pub fn load(root: &Path) -> Vec<ApprovedCommand> {
     let Ok(text) = std::fs::read_to_string(root.join(".do").join("commands.json")) else {
@@ -51,13 +58,44 @@ pub fn load(root: &Path) -> Vec<ApprovedCommand> {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
-/// 写批准列表（`.do/` 目录不存在则先建）。
+/// 写工作区层批准列表（`.do/` 目录不存在则先建）。
 pub fn save(root: &Path, cmds: &[ApprovedCommand]) -> io::Result<()> {
     let dir = root.join(".do");
     std::fs::create_dir_all(&dir)?;
     let text = serde_json::to_string_pretty(cmds)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     std::fs::write(dir.join("commands.json"), text)
+}
+
+/// 读全局层批准列表（exe 旁 do.commands.json）。
+/// 全局层在工作区之外，对 AI 物理不可达——天然满足隐形。
+pub fn load_global(exe_dir: &Path) -> Vec<ApprovedCommand> {
+    let Ok(text) = std::fs::read_to_string(exe_dir.join(GLOBAL_FILE)) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// 写全局层批准列表
+pub fn save_global(exe_dir: &Path, cmds: &[ApprovedCommand]) -> io::Result<()> {
+    let text = serde_json::to_string_pretty(cmds)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    std::fs::write(exe_dir.join(GLOBAL_FILE), text)
+}
+
+/// 合并视图：工作区层 + 全局层，重名工作区赢；每条带来源层标注。
+/// 元组 ≈ C# 的 (T, string) ValueTuple——轻量捆绑，不值得单建类型。
+pub fn merged(root: &Path, exe_dir: Option<&Path>) -> Vec<(ApprovedCommand, &'static str)> {
+    let mut out: Vec<(ApprovedCommand, &'static str)> = load(root)
+        .into_iter()
+        .map(|c| (c, "工作区"))
+        .collect();
+    for c in exe_dir.map(load_global).unwrap_or_default() {
+        if !out.iter().any(|(w, _)| w.name == c.name) {
+            out.push((c, "全局"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -80,6 +118,7 @@ mod tests {
             command: "npm run dev".into(),
             description: "启动开发服务器".into(),
             mode: "daemon".into(),
+            global: false,
         }];
         save(&dir, &cmds).unwrap();
         let back = load(&dir);
@@ -99,5 +138,39 @@ mod tests {
         assert!(!valid_name("a/b")); // 斜杠
         assert!(!valid_name("cmd;rm")); // 注入字符
         assert!(!valid_name("中文名")); // 非 ASCII
+    }
+
+    fn cmd(name: &str) -> ApprovedCommand {
+        ApprovedCommand {
+            name: name.into(),
+            command: format!("echo {name}"),
+            description: String::new(),
+            mode: "once".into(),
+            global: false,
+        }
+    }
+
+    #[test]
+    fn merged_view_workspace_wins_with_source_labels() {
+        let (ws, exe) = (temp_dir("mw"), temp_dir("me"));
+        save(&ws, &[cmd("a"), cmd("shared")]).unwrap();
+        let mut gshared = cmd("shared");
+        gshared.command = "echo shared-global".into(); // 同名不同串，区分谁赢
+        save_global(&exe, &[gshared, cmd("g")]).unwrap();
+        // 落盘 JSON 不含 global 标记字段（层归属由文件位置表达）
+        let text = std::fs::read_to_string(ws.join(".do/commands.json")).unwrap();
+        assert!(!text.contains("global"));
+
+        let view = merged(&ws, Some(&exe));
+        let names: Vec<&str> = view.iter().map(|(c, _)| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "shared", "g"]); // 重名只出现一次
+        // 重名工作区赢：shared 的 command 是工作区层那一条
+        let shared = view.iter().find(|(c, _)| c.name == "shared").unwrap();
+        assert_eq!(shared.0.command, "echo shared");
+        assert_eq!(shared.1, "工作区");
+        assert_eq!(view.iter().find(|(c, _)| c.name == "g").unwrap().1, "全局");
+        // exe_dir 不可用 → 只工作区层
+        assert_eq!(merged(&ws, None).len(), 2);
+        let _ = (std::fs::remove_dir_all(&ws), std::fs::remove_dir_all(&exe));
     }
 }
