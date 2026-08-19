@@ -144,7 +144,7 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.sh | sh
 ```
 
-Windows（PowerShell）：`iwr https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.ps1 | iex`
+Windows（PowerShell）：`irm https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.ps1 | iex`
 
 都是删掉二进制和伴生文件（配置/白名单/审计日志），Windows 版还会移除 PATH 条目。除此之外什么都没有——没有注册表，没有后台服务，没有藏在 `%APPDATA%` 里的惊喜。
 

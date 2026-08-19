@@ -1,4 +1,4 @@
-# DoAgent Windows 卸载：iwr https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.ps1 | iex
+# DoAgent Windows 卸载：irm https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.ps1 | iex
 # 删除 %LOCALAPPDATA%\Programs\do 整个文件夹（含配置/白名单/审计），并从用户 PATH 移除该目录。
 $ErrorActionPreference = "Stop"
 $dir = "$env:LOCALAPPDATA\Programs\do"
