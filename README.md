@@ -45,7 +45,13 @@ curl -fsSL https://raw.githubusercontent.com/mydouleur/DoAgent/main/install.sh |
 
 The script detects your OS/arch (and on Linux picks the musl static build unless your system has OpenSSL 3), downloads the latest release, and installs to `/usr/local/bin` or `~/.local/bin`.
 
-Windows: download `do-windows-x86_64.exe` from [Releases](https://github.com/mydouleur/DoAgent/releases), drop it into a folder on your PATH.
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/mydouleur/DoAgent/main/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\Programs\do` and adds it to your user PATH (no admin needed). Or download `do-windows-x86_64.exe` from [Releases](https://github.com/mydouleur/DoAgent/releases) manually.
 
 ## Quick start
 
@@ -130,11 +136,15 @@ macOS first run: `xattr -d com.apple.quarantine do` (the install script does thi
 
 ## Uninstall
 
-```
-Delete the folder that holds do.
+Linux / macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.sh | sh
 ```
 
-That's it. No registry, no background services, no surprises hidden in `%APPDATA%`.
+Windows (PowerShell): `iwr https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.ps1 | iex`
+
+Both delete the binary plus its sidecar files (config / whitelist / audit log) and, on Windows, remove the PATH entry. Nothing else exists — no registry, no services, no surprises in `%APPDATA%`.
 
 ## Build it yourself
 

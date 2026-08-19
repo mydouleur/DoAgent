@@ -47,7 +47,13 @@ curl -fsSL https://raw.githubusercontent.com/mydouleur/DoAgent/main/install.sh |
 
 脚本自动识别系统/架构（Linux 上会探测 OpenSSL 3，没有就给 musl 静态通用版），拉取最新 Release，装到 `/usr/local/bin` 或 `~/.local/bin`。
 
-Windows：从 [Releases](https://github.com/mydouleur/DoAgent/releases) 下载 `do-windows-x86_64.exe`，放进 PATH 里的任意目录。
+Windows（PowerShell）：
+
+```powershell
+irm https://raw.githubusercontent.com/mydouleur/DoAgent/main/install.ps1 | iex
+```
+
+装到 `%LOCALAPPDATA%\Programs\do` 并加入用户 PATH（免管理员）。或从 [Releases](https://github.com/mydouleur/DoAgent/releases) 手动下载 `do-windows-x86_64.exe`。
 
 ## 快速开始
 
@@ -132,11 +138,15 @@ macOS 首次运行：`xattr -d com.apple.quarantine do`（install.sh 已自动�
 
 ## 卸载
 
-```
-删掉放 do.exe 的那个文件夹。
+Linux / macOS：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.sh | sh
 ```
 
-就这一件事。没有注册表，没有后台服务，没有藏在 `%APPDATA%` 里的惊喜。
+Windows（PowerShell）：`iwr https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.ps1 | iex`
+
+都是删掉二进制和伴生文件（配置/白名单/审计日志），Windows 版还会移除 PATH 条目。除此之外什么都没有——没有注册表，没有后台服务，没有藏在 `%APPDATA%` 里的惊喜。
 
 ## 自己构建
 
