@@ -22,13 +22,11 @@ do
 /setting -g model 模型名
 ```
 
-每个项目告诉它怎么拿编译反馈：
+每个项目告诉它怎么拿编译反馈——像所有命令一样注册一条（审批页确认后生效）：
 
 ```
-/setting start cargo build        # 或 npm run build、go build ./...、make check …
+/addcmd build cargo build        # 或 npm run build、go build ./...、make check …
 ```
-
-`start` 会自动出现在白名单里（见第 4 节）。
 
 裸 `/setting` 打开交互式设置页：↑↓ 选择、Enter 编辑、Esc 返回。key 显示掩码（`sk-****xxxx`），每个值标注来自哪一层。
 
@@ -36,7 +34,7 @@ do
 
 | 命令 | 说明 |
 |---|---|
-| `/setting [-g] <字段> <值>` | 设置 `url`/`key`/`model`/`start`/`lang`；`-g` 写全局层；裸命令打开设置页 |
+| `/setting [-g] <字段> <值>` | 设置 `url`/`key`/`model`；`-g` 写全局层；裸命令打开设置页 |
 | `/lang [zh\|en]` | 切换界面语言，裸敲轮换；持久化到全局层 |
 | `/new` | 清空对话历史；AI 会自行读取 `HANDOFF.md` 续接 |
 | `/addcmd [-g] <name> <命令...>` | 自助注册固定命令（仍会过审批页确认）；`-g` 全项目生效 |
@@ -82,12 +80,11 @@ AI 调用内建工具 `addcmd`，参数为 `name`（须匹配 `^[a-zA-Z0-9_-]+$`
   "url": "https://api.deepseek.com/v1",
   "key": "sk-...",
   "model": "deepseek-chat",
-  "start": "cargo build",
   "lang": "zh"
 }
 ```
 
-生效值 = 工作区非空 → 全局非空 → 内置默认。`start` 只属于工作区层（它是项目属性）；`lang` 接受 `zh` / `en`。
+生效值 = 工作区非空 → 全局非空 → 内置默认。`lang` 在 JSON 里但只由 `/lang` 写入（`/setting` 不管它）。
 
 `.do/commands.json`：
 

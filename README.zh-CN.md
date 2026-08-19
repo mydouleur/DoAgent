@@ -66,7 +66,7 @@ do
 /setting -g url https://你的OpenAI兼容API地址
 /setting -g key sk-xxxxxxxx
 /setting -g model 模型名
-/setting start cargo build      ← 这个项目的编译命令（工作区层）
+/addcmd build cargo build      ← 这个项目的编译命令（审批页确认后生效）
 ```
 
 然后直接说话就行："帮我看看 src/main.rs 的错误"。
@@ -102,7 +102,7 @@ do
 
 | 输入 | 作用 |
 |---|---|
-| `/setting [-g] <url\|key\|model\|start\|lang> <值>` | 改配置（带 `-g` 写全局）；裸 `/setting` 打开设置页 |
+| `/setting [-g] <url\|key\|model> <值>` | 改配置（带 `-g` 写全局）；裸 `/setting` 打开设置页 |
 | `/lang [zh\|en]` | 切换界面语言（裸敲轮换） |
 | `/new` | 新对话（AI 自行读取 HANDOFF.md 续接） |
 | `/addcmd <name> <命令>` | 自助注册白名单命令 |
@@ -116,7 +116,7 @@ do
 
 | 层 | 位置 | 存什么 |
 |---|---|---|
-| 工作区（优先） | `项目\.do\config.json` + `.do\commands.json` | `start`、本项目覆盖项、项目命令 |
+| 工作区（优先） | `项目\.do\config.json` + `.do\commands.json` | 本项目覆盖项、项目命令 |
 | 全局（便携） | `do.exe` 旁的 `do.config.json` + `do.commands.json` | `url` / `key` / `model` / `lang`、跨项目命令 |
 
 ## 上下文管理：/new 即压缩

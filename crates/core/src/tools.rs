@@ -11,7 +11,6 @@
 //! 超限直接在源头掐断，只把截断后的内容送回模型。
 
 use crate::commands::ApprovedCommand;
-use crate::config::Config;
 use crate::workspace::Workspace;
 use serde_json::{json, Value};
 use std::borrow::Cow;
@@ -351,25 +350,10 @@ async fn tool_runcmd(ws: &Workspace, args: &Value) -> String {
     }
 }
 
-/// 白名单合并视图 = 工作区层 + 全局层（重名工作区赢，带来源标注）
-/// 外加隐式 start 条目（config.start 非空时并入工作区侧，不落盘）。
+/// 白名单合并视图 = 工作区层 + 全局层（重名工作区赢，带来源标注）。
 /// 全局层文件在 exe 旁、工作区之外，AI 物理不可达。
 fn whitelist(ws: &Workspace) -> Vec<(ApprovedCommand, &'static str)> {
-    let mut cmds = crate::commands::merged(ws.root(), crate::config::exe_dir().as_deref());
-    let start = Config::load_workspace(ws.root()).start;
-    if !start.is_empty() && !cmds.iter().any(|(c, _)| c.name == "start") {
-        cmds.push((
-            ApprovedCommand {
-                name: "start".into(),
-                command: start,
-                description: "配置的启动/构建命令（/setting start 设置）".into(),
-                mode: "once".into(),
-                global: false,
-            },
-            "工作区",
-        ));
-    }
-    cmds
+    crate::commands::merged(ws.root(), crate::config::exe_dir().as_deref())
 }
 
 /// 执行批准的固定命令：once 等结束返回输出尾部；daemon 后台 spawn 立即返回。
@@ -606,23 +590,6 @@ mod tests {
         crate::commands::save(&dir, &cmds).unwrap();
         let out = run(&ws, "runcmd", &json!({"name": "hello"})).await;
         assert!(out.contains("未知命令 hello"), "{out}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn implicit_start_entry() {
-        let (ws, dir) = temp_ws("c3");
-        // config.start 为空：列表里没有 start
-        let out = run(&ws, "runcmd", &json!({})).await;
-        assert!(!out.contains("start"), "{out}");
-        // 配上 start：成为隐式条目（once），且可通过 runcmd 执行
-        let mut cfg = Config::default();
-        cfg.set("start", "echo implicit-start").unwrap();
-        cfg.save(&dir).unwrap();
-        let out = run(&ws, "runcmd", &json!({})).await;
-        assert!(out.contains("start = `echo implicit-start`（once·工作区）"), "{out}");
-        let out = run(&ws, "runcmd", &json!({"name": "start"})).await;
-        assert!(out.contains("implicit-start"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

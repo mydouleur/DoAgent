@@ -2,10 +2,12 @@
 //!
 //! # 模块导读
 //! 配置分两层，按优先级覆盖合并：
-//! 1. **工作区层** `.do/config.json`（项目级，对 AI 代码级隐形）——四项：
-//!    `url`、`key`、`model`、`start`（启动命令，只属于项目）；
+//! 1. **工作区层** `.do/config.json`（项目级，对 AI 代码级隐形）——
+//!    存 `url`/`key`/`model` 的项目级覆盖；
 //! 2. **全局便携层** `do.config.json`，放在 **do.exe 同目录**（对 AI 物理不可达，
-//!    因为它在工作区之外）——只存 `url`/`key`/`model` 这三项"人的身份"。
+//!    因为它在工作区之外）——存 `url`/`key`/`model`/`lang` 这些"人的身份"。
+//!
+//! `lang` 字段仍在 JSON 里，但只由 `/lang` 命令写入，/setting 不管它。
 //!
 //! 合并规则：**工作区非空字段 > 全局非空字段 > 内置默认**（url 默认
 //! https://api.openai.com/v1）。
@@ -24,9 +26,11 @@ use std::path::{Path, PathBuf};
 /// 全局层文件名（exe 同目录）
 pub const GLOBAL_FILE: &str = "do.config.json";
 
-/// 四项配置，缺哪项补哪项。
+/// 配置项，缺哪项补哪项。
 /// derive 宏：`#[derive(...)]` 让编译器自动生成 trait 实现——
 /// Serialize/Deserialize ≈ C# 的 [Serializable] + JsonConverter，但零运行时反射。
+/// 没有 deny_unknown_fields：旧配置里的已删字段（如 start）读取时被忽略，
+/// 向后兼容不炸。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)] // 反序列化时缺失字段用 Default 填充（读旧版配置不炸）
 pub struct Config {
@@ -36,10 +40,7 @@ pub struct Config {
     pub key: String,
     /// 模型名
     pub model: String,
-    /// 配置的启动/构建命令（可含空格；项目级，不进全局层）。
-    /// 不再是独立工具：非空时作为隐式条目并入 runcmd 的白名单视图
-    pub start: String,
-    /// 界面语言：zh / en（默认 en；身份项，可进全局层）
+    /// 界面语言：zh / en（默认 en；身份项；只由 /lang 命令写入）
     pub lang: String,
 }
 
@@ -100,8 +101,6 @@ impl Config {
             url: pick([ws.url, global.url, def.url]),
             key: pick([ws.key, global.key, def.key]),
             model: pick([ws.model, global.model, def.model]),
-            // start 只属于工作区层，不参与全局合并
-            start: pick([ws.start, String::new(), String::new()]),
             lang: pick([ws.lang, global.lang, def.lang]),
         }
     }
@@ -115,7 +114,7 @@ impl Config {
         std::fs::write(dir.join("config.json"), text)
     }
 
-    /// 写全局便携层——只落 url/key/model/lang 身份项，start 永不进全局层。
+    /// 写全局便携层——只落 url/key/model/lang 身份项。
     pub fn save_global(&self, exe_dir: &Path) -> io::Result<()> {
         let text = serde_json::to_string_pretty(&serde_json::json!({
             "url": self.url,
@@ -128,6 +127,7 @@ impl Config {
     }
 
     /// 修改某一项；字段名不合法时返回错误文案（给 /setting 用）。
+    /// lang 不在这里改——/lang 是唯一切换入口（直接写字段，不走 set）。
     pub fn set(&mut self, field: &str, value: &str) -> Result<(), String> {
         // `&mut self`：可变借用，≈ C# 里直接改 this，但 Rust 保证
         // 同一时刻只有这一个可变引用存在——编译期的"锁"。
@@ -135,23 +135,14 @@ impl Config {
             "url" => self.url = value.to_string(),
             "key" => self.key = value.to_string(),
             "model" => self.model = value.to_string(),
-            "start" => self.start = value.to_string(),
-            "lang" => {
-                if !matches!(value, "zh" | "en") {
-                    return Err("lang 只支持 zh | en".to_string());
-                }
-                self.lang = value.to_string();
-            }
-            _ => return Err(format!("未知配置项 {field}（可选: url/key/model/start/lang）")),
+            "lang" => return Err("lang 请用 /lang 切换（/lang zh|en）".to_string()),
+            _ => return Err(format!("未知配置项 {field}（可选: url/key/model）")),
         }
         Ok(())
     }
 
-    /// 修改全局层的某一项：start 是项目级配置，拒绝进全局层。
+    /// 修改全局层的某一项（与 set 同规则；保留入口仅为 /setting -g 语义对称）。
     pub fn set_global(&mut self, field: &str, value: &str) -> Result<(), String> {
-        if field == "start" {
-            return Err("start 是项目级配置，请去掉 -g：/setting start <命令>".to_string());
-        }
         self.set(field, value)
     }
 }
@@ -192,41 +183,45 @@ mod tests {
         // 两层都没有：全部回落内置默认 / 空
         let merged = Config::load_merged(&ws, None); // None = current_exe 失败的降级路径
         assert_eq!(merged.url, "https://api.openai.com/v1");
-        assert!(merged.key.is_empty() && merged.model.is_empty() && merged.start.is_empty());
+        assert!(merged.key.is_empty() && merged.model.is_empty() && merged.lang.is_empty());
         let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
-    fn global_layer_never_stores_start() {
-        let exe = temp_dir("m3e");
-        let mut g = Config::default();
-        g.set("key", "k").unwrap();
-        g.set("start", "cargo build").unwrap(); // 即便内存里有 start
-        g.save_global(&exe).unwrap();
-        let text = std::fs::read_to_string(exe.join(GLOBAL_FILE)).unwrap();
-        assert!(!text.contains("start")); // 落盘文件里没有它
-        assert!(Config::load_global(&exe).start.is_empty());
-        let _ = std::fs::remove_dir_all(&exe);
+    fn legacy_start_key_ignored() {
+        // 向后兼容：旧配置里的 start 键被静默忽略，不炸
+        let ws = temp_dir("m3w");
+        std::fs::create_dir_all(ws.join(".do")).unwrap();
+        std::fs::write(
+            ws.join(".do/config.json"),
+            "{\"start\": \"cargo build\", \"model\": \"m\"}",
+        )
+        .unwrap();
+        let cfg = Config::load_workspace(&ws);
+        assert_eq!(cfg.model, "m");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
-    fn set_global_rejects_start() {
+    fn set_rejects_start_and_lang() {
         let mut g = Config::default();
+        // start 已连根拔：落入未知字段提示
+        assert!(g.set("start", "x").unwrap_err().contains("未知配置项"));
         assert!(g.set_global("start", "x").is_err());
-        assert!(g.set_global("model", "gpt-4o").is_ok());
+        // lang 不走 /setting：提示用 /lang
+        assert!(g.set("lang", "zh").unwrap_err().contains("/lang"));
+        assert!(g.set("model", "gpt-4o").is_ok());
         assert_eq!(g.model, "gpt-4o");
     }
 
     #[test]
-    fn lang_field_validates_and_roundtrips() {
+    fn lang_roundtrips_global_layer() {
         let exe = temp_dir("lang");
-        let mut c = Config::default();
-        assert!(c.set("lang", "fr").is_err()); // 只接受 zh|en
-        c.set("lang", "zh").unwrap();
-        c.save_global(&exe).unwrap(); // lang 是身份项，可进全局层
+        // /lang 直接写字段，不走 set（结构体更新语法 ≈ C# 的对象初始化器）
+        let c = Config { lang: "zh".to_string(), ..Config::default() };
+        c.save_global(&exe).unwrap();
         let back = Config::load_global(&exe);
         assert_eq!(back.lang, "zh");
-        // start 仍不进全局层
         assert!(std::fs::read_to_string(exe.join(GLOBAL_FILE)).unwrap().contains("\"lang\""));
         let _ = std::fs::remove_dir_all(&exe);
     }

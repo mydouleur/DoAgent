@@ -43,11 +43,10 @@ read（≤400 行）/ write / edit（精确替换，多处未 all 则报错）/ 
 - **AI 提案恒落工作区层**——AI 不能获得跨项目生效的命令
 - `/deletecmd [name]` 撤销；重名工作区层赢，列表带来源标注
 - 执行统一 shell 包装（Windows `cmd /c` / Unix `sh -c`），审批常量零拼接无注入面，cwd 固定工作区根
-- `/setting start` 的命令作为隐式条目（name="start"）并入白名单视图，不落盘
 
 ### 配置（双层，覆盖合并）
 
-工作区 `.do/config.json`（优先）> exe 旁 `do.config.json` > 内置默认。全局层存 url/key/model/lang（"人"的身份），start 只在工作区层。`/setting [-g] <字段> <值>`；裸 `/setting` 开设置页（显示合并生效值 + 来源标注，key 掩码）。`/lang [zh|en]` 切换语言（持久化全局层）。
+工作区 `.do/config.json`（优先）> exe 旁 `do.config.json` > 内置默认。全局层存 url/key/model/lang（"人"的身份）。`/setting [-g] <url|key|model> <值>`；裸 `/setting` 开设置页（显示合并生效值 + 来源标注，key 掩码）。`/lang [zh|en]` 切换语言（lang 只由 /lang 写入，/setting 拒绝该字段）。
 
 ### 上下文
 
@@ -74,7 +73,7 @@ win（Schannel）/ mac（Security.framework）/ linux-gnu（系统 OpenSSL 3）�
 
 - **v0.1**：初始实现——workspace 拆分、6 工具、`.do` 隐形、SSE 累加器、双层配置、splash、/setting 页
 - **v0.2 批次**：Markdown 全量渲染（pulldown-cmark，仅 do crate）；思考流式可见/正文开始自动折叠；工具调用函数样式 `read("src/main.rs")`；Esc 取消；参数校验失败回填模型自愈
-- **命令白名单**：addcmd 提案 + /allowcmd 审批 + /deletecmd 撤销 + 人类 /addcmd 自助注册；发现式注入（tools 冻结，批准零缓存代价）；start 独立工具弃用
+- **命令白名单**：addcmd 提案 + /allowcmd 审批 + /deletecmd 撤销 + 人类 /addcmd 自助注册；发现式注入（tools 冻结，批准零缓存代价）；start 独立工具弃用，后彻底删除（config 字段、隐式条目、设置页行全清，构建命令走 `/addcmd build ...` 平权注册）
 - **体验批次**：/setting 合并视图修复；splash 仅按键进入；工具状态字 doing（黄，点号动画）/done（绿）/已取消（红）；ToolStart 提前到流式中段（name 首现即宣告）；TLS 平台分叉（Windows 2.78→1.95 MB）；macOS 入 CI 矩阵；tui.rs 拆 mod/pages/forms
 - **全局命令层 + JSONL 审计**：见上文规格
 - **i18n + 紧凑布局 + /lang**：lang.rs 静态表（编译器强制双语齐全）；md 渲染三层策略——段落/列表/引用零空行，空行只在标题/代码块/分隔线边界且幂等去重；修复标题样式栈泄漏

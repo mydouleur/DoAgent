@@ -76,8 +76,8 @@ impl Lang {
                 "用法: /addcmd [-g] <name> <命令全文>",
             ),
             Key::UsageSetting => (
-                "usage: /setting [-g] <url|key|model|start|lang> <value> (-g writes global layer)",
-                "用法: /setting [-g] <url|key|model|start|lang> <值>（-g 写全局层）",
+                "usage: /setting [-g] <url|key|model> <value> (-g writes global layer)",
+                "用法: /setting [-g] <url|key|model> <值>（-g 写全局层）",
             ),
             Key::BadName => (
                 "name may only contain letters/digits/_/-",
@@ -112,7 +112,7 @@ impl Lang {
             Key::NameConflict => ("name conflict: {} is already taken", "name 冲突：{} 已被占用"),
             Key::Rejected => ("rejected proposal: {}", "已拒绝提案: {}"),
             // ---- slash 候选用法 ----
-            Key::UsageCmdSetting => ("/setting [-g] <url|key|model|start|lang> <value>", "/setting [-g] <url|key|model|start|lang> <值>"),
+            Key::UsageCmdSetting => ("/setting [-g] <url|key|model> <value>", "/setting [-g] <url|key|model> <值>"),
             Key::UsageCmdNew => ("/new", "/new"),
             Key::UsageCmdAddcmd => ("/addcmd <name> <full command>", "/addcmd <name> <命令全文>"),
             Key::UsageCmdAllowcmd => ("/allowcmd review command proposals", "/allowcmd 审批命令提案"),
@@ -122,10 +122,6 @@ impl Lang {
             Key::SettingsHeaderGlobal => (
                 "global (edits write to do.config.json next to the exe; values shown are effective)",
                 "全局（编辑写往 exe 旁 do.config.json；值 = 生效值）",
-            ),
-            Key::SettingsHeaderWs => (
-                "workspace (edits write to .do/config.json)",
-                "工作区（编辑写往 .do/config.json）",
             ),
             Key::Unset => ("(unset)", "（未设置）"),
             Key::SrcWorkspace => ("workspace", "工作区"),
@@ -203,7 +199,6 @@ pub enum Key {
     UsageCmdQuit,
     UsageCmdDeletecmd,
     SettingsHeaderGlobal,
-    SettingsHeaderWs,
     Unset,
     SrcWorkspace,
     SrcGlobal,
@@ -266,7 +261,6 @@ pub const ALL_KEYS: &[Key] = &[
     Key::UsageCmdQuit,
     Key::UsageCmdDeletecmd,
     Key::SettingsHeaderGlobal,
-    Key::SettingsHeaderWs,
     Key::Unset,
     Key::SrcWorkspace,
     Key::SrcGlobal,
@@ -298,7 +292,7 @@ mod tests {
             assert!(!Lang::Zh.t(*key).is_empty(), "{key:?}");
         }
         // ALL_KEYS 覆盖性：变体数应与枚举一致（漏加 key 时此处会落后）
-        assert_eq!(ALL_KEYS.len(), 58);
+        assert_eq!(ALL_KEYS.len(), 57);
     }
 
     #[test]

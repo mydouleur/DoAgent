@@ -122,10 +122,6 @@ pub(super) fn settings_lines(ui: &Ui) -> Vec<Line<'static>> {
         Line::from(Span::styled(ui.lang.t(Key::SettingsHeaderGlobal), section)),
     ];
     for (i, (field, _)) in SETTINGS_FIELDS.iter().enumerate() {
-        if *field == "start" {
-            out.push(Line::from(""));
-            out.push(Line::from(Span::styled(ui.lang.t(Key::SettingsHeaderWs), section)));
-        }
         // key 显示掩码；空值显示占位
         let shown = if *field == "key" {
             mask_key(&ui.set_values[i])

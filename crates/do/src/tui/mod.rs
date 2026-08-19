@@ -88,12 +88,12 @@ enum Item {
 }
 
 /// 设置页字段表：字段名 + 是否全局层（false = 工作区层）
+/// 设置页字段表：字段名 + 是否全局层（当前三项全是全局身份项，
+/// 工作区 Section 为空则不显示）
 const SETTINGS_FIELDS: &[(&str, bool)] = &[
     ("url", true),
     ("key", true),
     ("model", true),
-    ("lang", true),
-    ("start", false),
 ];
 
 /// 取消标记：agent 取消时遗留进行中块的结果文本（渲染层据此显红色"已取消"）
@@ -604,9 +604,6 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                     if field == "key" {
                         ui.has_key = true;
                     }
-                    if field == "lang" {
-                        ui.lang = Lang::parse(value);
-                    }
                     ui.items.push(Item::Info(msg));
                 }
                 Err(e) => ui.items.push(Item::Info(e)),
@@ -659,10 +656,11 @@ fn persist_lang(value: &str) -> Result<(), String> {
     persist_lang_to(&dir, value)
 }
 
-/// 实际写入：读全局层 → 改 lang → 写回
+/// 实际写入：读全局层 → 改 lang → 写回。
+/// 直接写字段而非 Config::set——/lang 是 lang 的唯一写入入口，set 不管它
 fn persist_lang_to(dir: &Path, value: &str) -> Result<(), String> {
     let mut cfg = Config::load_global(dir);
-    cfg.set("lang", value)?;
+    cfg.lang = value.to_string();
     cfg.save_global(dir).map_err(|e| e.to_string())
 }
 
@@ -1034,7 +1032,7 @@ mod tests {
         assert!(slash_hint("abc", Lang::Zh).is_empty());
         assert!(slash_hint("/x", Lang::Zh).is_empty()); // 无命中
         // `/s` 只剩 /setting
-        assert_eq!(slash_hint("/s", Lang::Zh), "/setting [-g] <url|key|model|start|lang> <值>");
+        assert_eq!(slash_hint("/s", Lang::Zh), "/setting [-g] <url|key|model> <值>");
         // `/` 显示全部候选
         let all = slash_hint("/", Lang::Zh);
         assert!(all.contains("/setting") && all.contains("/new") && all.contains("/quit"));
@@ -1259,7 +1257,7 @@ mod tests {
         assert!(hint_text(&ui).contains("展开/折叠"));
         ui.lang = Lang::En;
         assert!(hint_text(&ui).contains("expand/collapse"));
-        assert_eq!(slash_hint("/s", Lang::En), "/setting [-g] <url|key|model|start|lang> <value>");
+        assert_eq!(slash_hint("/s", Lang::En), "/setting [-g] <url|key|model> <value>");
         assert!(slash_hint("/s", Lang::Zh).contains("<值>"));
     }
 

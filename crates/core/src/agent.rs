@@ -434,7 +434,7 @@ mod tests {
         assert!(check_call("runcmd", "{\"name\":1}").is_err());
         // 白名单名字不再是"已知工具"（发现式注入后校验只认 7 个内建名）
         assert!(check_call("deploy", "{}").unwrap_err().contains("未知工具"));
-        // start 已弃用为独立工具
+        // start 已彻底删除（字段/工具/隐式条目全清）
         assert!(check_call("start", "{}").unwrap_err().contains("未知工具"));
     }
 

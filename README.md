@@ -64,7 +64,7 @@ do
 /setting -g url https://your-openai-compatible-endpoint
 /setting -g key sk-xxxxxxxx
 /setting -g model your-model
-/setting start cargo build      ← how this project compiles (workspace layer)
+/addcmd build cargo build      ← this project's build command (approve in the review page)
 ```
 
 Then just talk: "check the error in src/main.rs".
@@ -100,7 +100,7 @@ It lives **outside the workspace**, so the AI can neither forge nor erase its ow
 
 | Input | Action |
 |---|---|
-| `/setting [-g] <url\|key\|model\|start\|lang> <value>` | change config (`-g` writes the global layer); bare `/setting` opens the settings page |
+| `/setting [-g] <url\|key\|model> <value>` | change config (`-g` writes the global layer); bare `/setting` opens the settings page |
 | `/lang [zh\|en]` | switch UI language (bare toggles) |
 | `/new` | new conversation (AI re-reads HANDOFF.md itself) |
 | `/addcmd <name> <command>` | self-register a whitelisted command |
@@ -114,7 +114,7 @@ It lives **outside the workspace**, so the AI can neither forge nor erase its ow
 
 | Layer | Location | Holds |
 |---|---|---|
-| Workspace (wins) | `project/.do/config.json` + `.do/commands.json` | `start`, per-project overrides, project commands |
+| Workspace (wins) | `project/.do/config.json` + `.do/commands.json` | per-project overrides, project commands |
 | Global (portable) | `do.config.json` + `do.commands.json` next to the binary | `url` / `key` / `model` / `lang`, cross-project commands |
 
 ## Context: /new is the compaction

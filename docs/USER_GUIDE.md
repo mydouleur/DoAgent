@@ -22,13 +22,11 @@ do
 /setting -g model your-model
 ```
 
-Per project, tell it how to get build feedback:
+Per project, tell it how to get build feedback — register a command like any other (it takes effect after you confirm in the review page):
 
 ```
-/setting start cargo build        # or: npm run build, go build ./..., make check …
+/addcmd build cargo build        # or: npm run build, go build ./..., make check …
 ```
-
-The `start` entry appears in the whitelist automatically (see §4).
 
 Bare `/setting` opens an interactive settings page: ↑↓ to select, Enter to edit, Esc to go back. The key is masked (`sk-****xxxx`); each value shows which layer it comes from.
 
@@ -36,7 +34,7 @@ Bare `/setting` opens an interactive settings page: ↑↓ to select, Enter to e
 
 | Command | Description |
 |---|---|
-| `/setting [-g] <field> <value>` | Set `url`/`key`/`model`/`start`/`lang`. `-g` writes the global layer. Bare `/setting` opens the settings page |
+| `/setting [-g] <field> <value>` | Set `url`/`key`/`model`. `-g` writes the global layer. Bare `/setting` opens the settings page |
 | `/lang [zh\|en]` | Switch UI language; bare toggles. Persisted to the global layer |
 | `/new` | Clear conversation history. The AI re-reads `HANDOFF.md` itself to continue |
 | `/addcmd [-g] <name> <command...>` | Register a fixed command yourself (still confirmed in the approval page). `-g` makes it available in all projects |
@@ -82,12 +80,11 @@ Name conflicts: the workspace layer wins. The listing shows the source of each e
   "url": "https://api.deepseek.com/v1",
   "key": "sk-...",
   "model": "deepseek-chat",
-  "start": "cargo build",
   "lang": "zh"
 }
 ```
 
-Effective value = workspace non-empty → global non-empty → built-in default. `start` is workspace-only (it's a project property). `lang` accepts `zh` or `en`.
+Effective value = workspace non-empty → global non-empty → built-in default. `lang` lives in the JSON but is written only by `/lang` (never by `/setting`).
 
 `.do/commands.json`:
 

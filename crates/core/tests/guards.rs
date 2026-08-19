@@ -20,13 +20,12 @@ fn config_roundtrip() {
     assert_eq!(merged.url, "https://api.openai.com/v1"); // 缺省 url
     let mut cfg = Config::default();
     cfg.set("model", "gpt-4o").unwrap();
-    // start 值允许含空格
-    cfg.set("start", "cargo build --release").unwrap();
     cfg.save(&dir).unwrap();
     let back = Config::load_workspace(&dir);
     assert_eq!(back.model, "gpt-4o");
-    assert_eq!(back.start, "cargo build --release");
     assert!(cfg.set("bogus", "x").is_err());
+    // start 已删除：落入未知字段提示
+    assert!(cfg.set("start", "cargo build").unwrap_err().contains("未知配置项"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

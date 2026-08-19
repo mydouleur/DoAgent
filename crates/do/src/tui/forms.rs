@@ -133,7 +133,7 @@ fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
     };
     // 与内建工具或同层已批准命令重名 = 拒绝（覆盖已有工具太危险）。
     // start 是隐式保留名（白名单视图会合并 config.start），一并保护
-    const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "addcmd", "runcmd", "start"];
+    const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "addcmd", "runcmd"];
     if BUILTIN.contains(&name.as_str()) || cmds.iter().any(|c| c.name == name) {
         ui.items.push(Item::Info(ui.lang.t(Key::NameConflict).replace("{}", &name)));
         return;
@@ -252,9 +252,6 @@ fn settings_save(ui: &mut Ui, root: &Path, value: String) {
             if field == "key" {
                 ui.has_key = !value.is_empty();
             }
-            if field == "lang" {
-                ui.lang = crate::lang::Lang::parse(&value);
-            }
             let key = if global { Key::UpdatedGlobalField } else { Key::UpdatedField };
             ui.items.push(Item::Info(ui.lang.t(key).replace("{}", field)));
         }
@@ -302,8 +299,6 @@ fn cfg_field(cfg: &Config, field: &str) -> String {
         "url" => cfg.url.clone(),
         "key" => cfg.key.clone(),
         "model" => cfg.model.clone(),
-        "start" => cfg.start.clone(),
-        "lang" => cfg.lang.clone(),
         _ => String::new(),
     }
 }
