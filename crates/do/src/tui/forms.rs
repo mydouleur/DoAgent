@@ -5,6 +5,7 @@
 //! 加上配套的读写动作。渲染在 pages 子模块；这里管"按键 → 状态/磁盘"。
 
 use super::{Item, Mode, Ui, SETTINGS_FIELDS};
+use crate::lang::Key;
 use agent_core::config::Config;
 use agent_core::{AgentHandle, Cmd};
 use crossterm::event::KeyCode;
@@ -111,7 +112,7 @@ fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
     let name = p.name.trim().to_string();
     // 批准前再验一次 name（AI 提案在 check_call 已验，这里双保险）
     if !agent_core::commands::valid_name(&name) {
-        ui.items.push(Item::Info("name 只能包含字母/数字/_/-".into()));
+        ui.items.push(Item::Info(ui.lang.t(Key::BadName).into()));
         return;
     }
     // 选定目标层：读该层名单
@@ -119,7 +120,7 @@ fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
         match agent_core::config::exe_dir() {
             Some(d) => Some(d),
             None => {
-                ui.items.push(Item::Info("无法定位 do.exe 目录，全局层不可用".into()));
+                ui.items.push(Item::Info(ui.lang.t(Key::NoExeDir).into()));
                 return;
             }
         }
@@ -134,7 +135,7 @@ fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
     // start 是隐式保留名（白名单视图会合并 config.start），一并保护
     const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "addcmd", "runcmd", "start"];
     if BUILTIN.contains(&name.as_str()) || cmds.iter().any(|c| c.name == name) {
-        ui.items.push(Item::Info(format!("name 冲突：{name} 已被占用")));
+        ui.items.push(Item::Info(ui.lang.t(Key::NameConflict).replace("{}", &name)));
         return;
     }
     cmds.push(p.clone());
@@ -144,8 +145,8 @@ fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
     };
     match save_result {
         Ok(()) => {
-            let layer = if p.global { " 全局" } else { "" };
-            ui.items.push(Item::Info(format!("已批准并注册{layer}: {name}")));
+            let key = if p.global { Key::ApprovedGlobal } else { Key::Approved };
+            ui.items.push(Item::Info(ui.lang.t(key).replace("{}", &name)));
             ui.pending.remove(ui.appr_sel);
             // 批准后通知模型：以 user 角色注入历史（不触发 API）。
             // tools 数组是冻结的，批准不改变 prompt 前缀——零缓存代价
@@ -163,7 +164,7 @@ fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
 /// 拒绝选中提案：丢弃，不入盘
 fn reject_current(ui: &mut Ui) {
     if let Some(p) = ui.pending.get(ui.appr_sel) {
-        ui.items.push(Item::Info(format!("已拒绝提案: {}", p.name)));
+        ui.items.push(Item::Info(ui.lang.t(Key::Rejected).replace("{}", &p.name)));
         ui.pending.remove(ui.appr_sel);
     }
     after_proposal_removed(ui);
@@ -205,11 +206,11 @@ pub(super) fn delete_key(ui: &mut Ui, code: KeyCode, root: &Path) {
                 };
                 match result {
                     Some(Ok(())) => {
-                        let layer = if src == "全局" { " 全局" } else { "" };
-                        ui.items.push(Item::Info(format!("已撤销{layer}: {}", gone.name)));
+                        let key = if src == "全局" { Key::RevokedGlobal } else { Key::Revoked };
+                        ui.items.push(Item::Info(ui.lang.t(key).replace("{}", &gone.name)));
                     }
                     Some(Err(e)) => ui.items.push(Item::Info(e.to_string())),
-                    None => ui.items.push(Item::Info("无法定位 do.exe 目录".into())),
+                    None => ui.items.push(Item::Info(ui.lang.t(Key::NoExeDir).into())),
                 }
                 ui.del_sel = ui.del_sel.min(ui.del_list.len().saturating_sub(1));
                 if ui.del_list.is_empty() {
@@ -232,7 +233,7 @@ fn settings_save(ui: &mut Ui, root: &Path, value: String) {
                 cfg.set(field, &value)
                     .and_then(|()| cfg.save_global(&dir).map_err(|e| e.to_string()))
             }
-            None => Err("无法定位 do.exe 目录，全局配置层不可用".to_string()),
+            None => Err(ui.lang.t(Key::NoExeDir).to_string()),
         }
     } else {
         let mut cfg = Config::load_workspace(root);
@@ -246,15 +247,16 @@ fn settings_save(ui: &mut Ui, root: &Path, value: String) {
             load_settings(ui, root);
             // 两层都影响状态栏，保存后刷新
             if field == "model" {
-                ui.model = if value.is_empty() { "未设置".into() } else { value.clone() };
+                ui.model = value.clone();
             }
             if field == "key" {
                 ui.has_key = !value.is_empty();
             }
-            ui.items.push(Item::Info(format!(
-                "已更新{} {field}",
-                if global { " 全局" } else { "" }
-            )));
+            if field == "lang" {
+                ui.lang = crate::lang::Lang::parse(&value);
+            }
+            let key = if global { Key::UpdatedGlobalField } else { Key::UpdatedField };
+            ui.items.push(Item::Info(ui.lang.t(key).replace("{}", field)));
         }
         Err(e) => ui.items.push(Item::Info(e)),
     }
@@ -268,7 +270,7 @@ pub(super) fn enter_settings(ui: &mut Ui, root: &Path) {
     ui.mode = Mode::Settings;
 }
 
-/// 载入设置页数据：值 = 合并后的生效值；来源 = 工作区/全局/默认。
+/// 载入设置页数据：值 = 合并后的生效值；来源标注按当前界面语言。
 fn load_settings(ui: &mut Ui, root: &Path) {
     let exe = agent_core::config::exe_dir();
     let ws = Config::load_workspace(root);
@@ -282,11 +284,11 @@ fn load_settings(ui: &mut Ui, root: &Path) {
         .iter()
         .map(|(f, _)| {
             if !cfg_field(&ws, f).is_empty() {
-                "工作区" // 工作区层非空：它优先
+                ui.lang.t(Key::SrcWorkspace) // 工作区层非空：它优先
             } else if global.as_ref().is_some_and(|g| !cfg_field(g, f).is_empty()) {
-                "全局" // 全局便携层兜底
+                ui.lang.t(Key::SrcGlobal) // 全局便携层兜底
             } else if !cfg_field(&merged, f).is_empty() {
-                "默认" // 两层皆空但生效值非空：内置默认（url）
+                ui.lang.t(Key::SrcDefault) // 两层皆空但生效值非空：内置默认（url）
             } else {
                 ""
             }
@@ -301,6 +303,7 @@ fn cfg_field(cfg: &Config, field: &str) -> String {
         "key" => cfg.key.clone(),
         "model" => cfg.model.clone(),
         "start" => cfg.start.clone(),
+        "lang" => cfg.lang.clone(),
         _ => String::new(),
     }
 }

@@ -77,10 +77,11 @@ Then just talk: "check the error in src/main.rs".
 
 | Input | Action |
 |---|---|
-| `/setting [-g] <url\|key\|model\|start> <value>` | change config (`-g` writes the global layer) |
+| `/setting [-g] <url\|key\|model\|start\|lang> <value>` | change config (`-g` writes the global layer; `lang` = `zh`\|`en`) |
 | `/new` | new conversation (AI re-reads HANDOFF.md itself) |
 | `/addcmd <name 命令>` | self-register a whitelisted command (confirms in the approval page) |
 | `/allowcmd` / `/deletecmd [name]` | approve AI proposals / revoke whitelisted commands |
+| `/lang [zh\|en]` | switch UI language (bare = toggle; saved to the global layer) |
 | `/quit` or `Ctrl+C` | exit |
 | `Ctrl+E` | expand/collapse thinking & tool calls |
 | `PageUp / PageDown` | scroll history |

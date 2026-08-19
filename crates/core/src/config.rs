@@ -39,6 +39,8 @@ pub struct Config {
     /// 配置的启动/构建命令（可含空格；项目级，不进全局层）。
     /// 不再是独立工具：非空时作为隐式条目并入 runcmd 的白名单视图
     pub start: String,
+    /// 界面语言：zh / en（默认 en；身份项，可进全局层）
+    pub lang: String,
 }
 
 /// do.exe 所在目录（全局层的安放处）。
@@ -100,6 +102,7 @@ impl Config {
             model: pick([ws.model, global.model, def.model]),
             // start 只属于工作区层，不参与全局合并
             start: pick([ws.start, String::new(), String::new()]),
+            lang: pick([ws.lang, global.lang, def.lang]),
         }
     }
 
@@ -112,12 +115,13 @@ impl Config {
         std::fs::write(dir.join("config.json"), text)
     }
 
-    /// 写全局便携层——只落 url/key/model 三项，start 永不进全局层。
+    /// 写全局便携层——只落 url/key/model/lang 身份项，start 永不进全局层。
     pub fn save_global(&self, exe_dir: &Path) -> io::Result<()> {
         let text = serde_json::to_string_pretty(&serde_json::json!({
             "url": self.url,
             "key": self.key,
             "model": self.model,
+            "lang": self.lang,
         }))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(exe_dir.join(GLOBAL_FILE), text)
@@ -132,7 +136,13 @@ impl Config {
             "key" => self.key = value.to_string(),
             "model" => self.model = value.to_string(),
             "start" => self.start = value.to_string(),
-            _ => return Err(format!("未知配置项 {field}（可选: url/key/model/start）")),
+            "lang" => {
+                if !matches!(value, "zh" | "en") {
+                    return Err("lang 只支持 zh | en".to_string());
+                }
+                self.lang = value.to_string();
+            }
+            _ => return Err(format!("未知配置项 {field}（可选: url/key/model/start/lang）")),
         }
         Ok(())
     }
@@ -205,5 +215,19 @@ mod tests {
         assert!(g.set_global("start", "x").is_err());
         assert!(g.set_global("model", "gpt-4o").is_ok());
         assert_eq!(g.model, "gpt-4o");
+    }
+
+    #[test]
+    fn lang_field_validates_and_roundtrips() {
+        let exe = temp_dir("lang");
+        let mut c = Config::default();
+        assert!(c.set("lang", "fr").is_err()); // 只接受 zh|en
+        c.set("lang", "zh").unwrap();
+        c.save_global(&exe).unwrap(); // lang 是身份项，可进全局层
+        let back = Config::load_global(&exe);
+        assert_eq!(back.lang, "zh");
+        // start 仍不进全局层
+        assert!(std::fs::read_to_string(exe.join(GLOBAL_FILE)).unwrap().contains("\"lang\""));
+        let _ = std::fs::remove_dir_all(&exe);
     }
 }

@@ -7,6 +7,7 @@
 //! 把 Ui 的字段逐个 pub 出去（≈ C# 的 internal 可见性）。
 
 use super::{wrap_text, Ui, SETTINGS_FIELDS};
+use crate::lang::Key;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -80,16 +81,25 @@ pub(super) fn draw_splash(frame: &mut Frame, area: Rect, ui: &Ui) {
     let mut lines: Vec<Line> = LOGO.lines().map(logo_line).collect();
     lines.push(Line::from(""));
     lines.push(Line::from(format!("DoAgent v{}", env!("CARGO_PKG_VERSION"))));
-    lines.push(Line::from(format!("工作区: {}", ui.workspace)));
+    lines.push(Line::from(format!(
+        "{}: {}",
+        ui.lang.t(Key::WorkspaceLabel),
+        ui.workspace
+    )));
     lines.push(Line::from(if ui.has_key {
-        "key 已设置".to_string()
+        ui.lang.t(Key::ApiKeySet).to_string()
     } else {
-        "key 未设置：/setting -g key <你的key>".to_string()
+        ui.lang.t(Key::ApiKeyMissing).to_string()
     }));
-    lines.push(Line::from(format!("model: {}", ui.model)));
+    let model = if ui.model.is_empty() {
+        ui.lang.t(Key::ModelUnset)
+    } else {
+        &ui.model
+    };
+    lines.push(Line::from(format!("model: {model}")));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "按任意键继续",
+        ui.lang.t(Key::SplashContinue),
         Style::default().fg(Color::DarkGray),
     )));
     // 垂直居中：上缘下移 (高度-内容)/2；水平居中交给 Alignment::Center
@@ -109,12 +119,12 @@ pub(super) fn settings_lines(ui: &Ui) -> Vec<Line<'static>> {
     let mut out = vec![
         Line::from(""),
         // 值是合并后的生效值；括号标注来源层；分区表示"编辑写往哪一层"
-        Line::from(Span::styled("全局（编辑写往 exe 旁 do.config.json；值 = 生效值）", section)),
+        Line::from(Span::styled(ui.lang.t(Key::SettingsHeaderGlobal), section)),
     ];
     for (i, (field, _)) in SETTINGS_FIELDS.iter().enumerate() {
-        if i == 3 {
+        if *field == "start" {
             out.push(Line::from(""));
-            out.push(Line::from(Span::styled("工作区（编辑写往 .do/config.json）", section)));
+            out.push(Line::from(Span::styled(ui.lang.t(Key::SettingsHeaderWs), section)));
         }
         // key 显示掩码；空值显示占位
         let shown = if *field == "key" {
@@ -122,8 +132,8 @@ pub(super) fn settings_lines(ui: &Ui) -> Vec<Line<'static>> {
         } else {
             ui.set_values[i].clone()
         };
-        let shown = if shown.is_empty() { "（未设置）".to_string() } else { shown };
-        // 来源层标注，如（工作区）/（全局）/（默认）
+        let shown = if shown.is_empty() { ui.lang.t(Key::Unset).to_string() } else { shown };
+        // 来源层标注（加载时已按语言写入 set_sources）
         let src = ui.set_sources.get(i).copied().unwrap_or("");
         let suffix = if src.is_empty() { String::new() } else { format!("（{src}）") };
         let selected = i == ui.set_sel;
@@ -151,7 +161,9 @@ pub(super) fn approve_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
     }
     out.push(Line::from(""));
     out.push(Line::from(Span::styled(
-        format!("命令提案审批（{} 条待批）", ui.pending.len()),
+        ui.lang
+            .t(Key::ApproveTitle)
+            .replace("{}", &ui.pending.len().to_string()),
         section,
     )));
     // 提案列表：name + 描述摘要
@@ -162,7 +174,7 @@ pub(super) fn approve_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
         } else {
             Style::default()
         };
-        let desc = if p.description.is_empty() { "(无)" } else { &p.description };
+        let desc = if p.description.is_empty() { ui.lang.t(Key::NoDesc) } else { &p.description };
         out.push(Line::from(Span::styled(
             format!("{} {:<12} {desc}", if selected { ">" } else { " " }, p.name),
             style,
@@ -171,22 +183,25 @@ pub(super) fn approve_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
     // 选中条详情
     if let Some(p) = ui.pending.get(ui.appr_sel) {
         out.push(Line::from(""));
-        out.push(Line::from(Span::styled("命令:".to_string(), section)));
+        out.push(Line::from(Span::styled(ui.lang.t(Key::CmdLabel).to_string(), section)));
         // command 可能很长，按宽度折行完整展示（只读，不可修改——
         // 审批的字符串 = 永远执行的全部内容）
         for l in wrap_text(&p.command, width.max(8)) {
             out.push(Line::from(Span::styled(l, Style::default().fg(Color::Yellow))));
         }
         // 目标层：AI 提案恒为工作区层；人类 /addcmd -g 注册的显示全局层
-        let target = if p.global { " · 批准到全局层" } else { "" };
+        let target = if p.global { ui.lang.t(Key::TargetGlobal) } else { "" };
         out.push(Line::from(Span::styled(format!("mode: {}{target}", p.mode), section)));
-        let desc = if p.description.is_empty() { "(无)" } else { &p.description };
+        let desc = if p.description.is_empty() { ui.lang.t(Key::NoDesc) } else { &p.description };
         let desc_style = if ui.appr_editing {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
-        out.push(Line::from(Span::styled(format!("描述: {desc}"), desc_style)));
+        out.push(Line::from(Span::styled(
+            ui.lang.t(Key::DescLabel).replace("{}", desc),
+            desc_style,
+        )));
     }
     out
 }
@@ -196,7 +211,7 @@ pub(super) fn delete_lines(ui: &Ui) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     out.push(Line::from(""));
     out.push(Line::from(Span::styled(
-        "已批准命令（Enter 删除即撤销该工具）",
+        ui.lang.t(Key::DeleteHeader),
         Style::default().fg(Color::DarkGray),
     )));
     for (i, (c, src)) in ui.del_list.iter().enumerate() {
@@ -206,6 +221,12 @@ pub(super) fn delete_lines(ui: &Ui) -> Vec<Line<'static>> {
         } else {
             Style::default()
         };
+        // src 来自 core 的合并视图（中文标签），展示时按界面语言映射
+        let src_disp = if *src == "全局" {
+            ui.lang.t(Key::SrcGlobal)
+        } else {
+            ui.lang.t(Key::SrcWorkspace)
+        };
         out.push(Line::from(Span::styled(
             format!(
                 "{} {:<12} = `{}`（{}·{}）",
@@ -213,7 +234,7 @@ pub(super) fn delete_lines(ui: &Ui) -> Vec<Line<'static>> {
                 c.name,
                 c.command,
                 c.mode,
-                src
+                src_disp
             ),
             style,
         )));

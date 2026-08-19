@@ -83,9 +83,12 @@ impl Renderer {
             Event::Code(c) => self.push_span(&c, self.style().patch(STYLE_INLINE_CODE)),
             Event::SoftBreak | Event::HardBreak => self.break_line(),
             Event::Rule => {
+                // 分隔线是重结构：前后各锚一个空行
                 self.break_line();
+                self.ensure_blank();
                 self.push_span("──────────", self.style());
                 self.break_line();
+                self.ensure_blank();
             }
             _ => {} // html/脚注/任务列表等忽略
         }
@@ -93,13 +96,17 @@ impl Renderer {
 
     fn on_start(&mut self, tag: Tag) {
         match tag {
+            // 段落/列表/引用：换行即分段，不制造空行（紧凑布局）
             Tag::Paragraph => self.break_line(),
             Tag::Heading { .. } => {
+                // 标题是重结构：前后各一个空行当视觉锚点
                 self.break_line();
+                self.ensure_blank();
                 self.styles.push(STYLE_HEADING);
             }
             Tag::CodeBlock(_) => {
                 self.break_line();
+                self.ensure_blank();
                 self.in_code_block = true;
                 self.styles.push(STYLE_CODE_BLOCK);
             }
@@ -126,11 +133,17 @@ impl Renderer {
 
     fn on_end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Heading(_) => self.break_line(),
+            TagEnd::Paragraph => self.break_line(),
+            TagEnd::Heading(_) => {
+                self.styles.pop(); // 修复：标题样式出栈（旧版漏 pop，会漏给后文）
+                self.break_line();
+                self.ensure_blank();
+            }
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
                 self.styles.pop();
                 self.break_line();
+                self.ensure_blank();
             }
             TagEnd::BlockQuote(_) => {
                 self.quote_depth -= 1;
@@ -177,16 +190,28 @@ impl Renderer {
         self.cur.push(Span::styled(text.to_string(), style));
     }
 
-    /// 结束当前逻辑行（空行也保留，维持段落间距）
+    /// 原语一：断行。只交出已积累的内容；cur 为空时什么都不产生——
+    /// 断行本身永远不制造空行（紧凑布局的第一层）
     fn break_line(&mut self) {
         // mem::take ≈ C# 里"取出引用并置 null"：所有权移出，原地留默认空 Vec
-        self.lines.push(Line::from(std::mem::take(&mut self.cur)));
+        if !self.cur.is_empty() {
+            self.lines.push(Line::from(std::mem::take(&mut self.cur)));
+        }
         self.line_started = false;
+    }
+
+    /// 原语二：确保空行（重结构边界的视觉锚点）。
+    /// 幂等：上一条输出已是空行、或还没有任何输出（文档开头）时跳过——
+    /// 连续结构事件不会叠出多个空行（紧凑布局的第二、三层）
+    fn ensure_blank(&mut self) {
+        if self.lines.last().is_some_and(|l| !l.spans.is_empty()) {
+            self.lines.push(Line::default());
+        }
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
         self.break_line();
-        // 去掉解析器事件边界产生的首尾空行
+        // 去掉可能残留的首尾空行（文档开头/结尾不锚空行）
         while self.lines.first().is_some_and(|l| l.spans.is_empty()) {
             self.lines.remove(0);
         }
@@ -269,5 +294,47 @@ mod tests {
         let flat = flatten(&render("> 引用一句"));
         let marker = flat.iter().find(|(t, _)| t.contains('│')).unwrap();
         assert_eq!(marker.1.fg, Some(Color::DarkGray));
+    }
+
+    /// 行级文本视图（空行为 ""）
+    fn texts(md: &str) -> Vec<String> {
+        render(md)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn paragraphs_have_no_blank_between() {
+        // 紧凑布局：段落间零空行
+        assert_eq!(texts("甲\n\n乙\n\n丙"), ["甲", "乙", "丙"]);
+    }
+
+    #[test]
+    fn code_block_has_exactly_one_blank_around() {
+        // 代码块前后恰一空行；文档开头侧不锚空行
+        assert_eq!(texts("```\nx\n```\n尾"), ["x", "", "尾"]);
+        assert_eq!(texts("头\n```\nx\n```"), ["头", "", "x"]);
+        assert_eq!(texts("头\n```\nx\n```\n尾"), ["头", "", "x", "", "尾"]);
+    }
+
+    #[test]
+    fn consecutive_blanks_collapse() {
+        // 标题接代码块：两个重结构相邻，空行不叠加
+        assert_eq!(texts("# 题\n```\nx\n```"), ["题", "", "x"]);
+    }
+
+    #[test]
+    fn list_items_have_no_blank_between() {
+        let t = texts("- 甲\n- 乙");
+        assert_eq!(t.len(), 2);
+        assert!(t[0].contains("- 甲") && t[1].contains("- 乙"));
+    }
+
+    #[test]
+    fn heading_has_one_blank_before_and_after() {
+        assert_eq!(texts("头\n# 题\n尾"), ["头", "", "题", "", "尾"]);
+        // 文档开头的标题：前面不锚空行
+        assert_eq!(texts("# 题\n尾"), ["题", "", "尾"]);
     }
 }

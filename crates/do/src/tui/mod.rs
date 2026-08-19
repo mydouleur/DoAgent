@@ -30,6 +30,7 @@
 //! - 子模块可见性：`pub(super)` ≈ C# 的 internal——只对父模块 tui 可见，
 //!   子模块可以直接看到父模块的私有项（Rust 的可见性向下渗透）。
 
+use crate::lang::{Key, Lang};
 use agent_core::config::Config;
 use agent_core::{AgentHandle, ApprovedCommand, Cmd, Evt};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -91,6 +92,7 @@ const SETTINGS_FIELDS: &[(&str, bool)] = &[
     ("url", true),
     ("key", true),
     ("model", true),
+    ("lang", true),
     ("start", false),
 ];
 
@@ -108,6 +110,8 @@ struct Ui {
     tokens: usize,
     model: String,
     has_key: bool,
+    /// 界面语言（/setting lang zh|en；默认 en）
+    lang: Lang,
     workspace: String,
     /// true 时退出主循环
     quit: bool,
@@ -196,7 +200,8 @@ pub async fn run(root: &Path) -> io::Result<()> {
         scroll: 0,
         expand_all: false,
         tokens: 0,
-        model: if cfg.model.is_empty() { "未设置".into() } else { cfg.model.clone() },
+        lang: Lang::parse(&cfg.lang),
+        model: cfg.model.clone(),
         has_key: !cfg.key.is_empty(),
         workspace: root.display().to_string(),
         quit: false,
@@ -216,19 +221,21 @@ pub async fn run(root: &Path) -> io::Result<()> {
         tick_count: 0,
     };
     // 启动信息（splash 下面的对话流里保留这几行供回看）
-    ui.items.push(Item::Info(format!("工作区: {}", ui.workspace)));
+    ui.items.push(Item::Info(format!(
+        "{}: {}",
+        ui.lang.t(Key::WorkspaceLabel),
+        ui.workspace
+    )));
     if exe_dir.is_none() {
         // 降级提示：全局层不可用但不影响使用，绝不 panic
-        ui.items.push(Item::Info(
-            "无法定位 do.exe 目录，全局配置层不可用（仅用工作区配置 + 默认值）".into(),
-        ));
+        ui.items.push(Item::Info(ui.lang.t(Key::GlobalLayerUnavailable).into()));
     }
     if !ui.has_key {
-        ui.items.push(Item::Info("未设置 API key，请用 /setting -g key <你的key>".into()));
+        ui.items.push(Item::Info(ui.lang.t(Key::ApiKeyMissing).into()));
     }
     // 审计可用性检查：不可写只是降级，但用户应当知道
     if !agent_core::audit::Audit::new(root).enabled() {
-        ui.items.push(Item::Info("审计日志不可写，已关闭（do.audit.jsonl）".into()));
+        ui.items.push(Item::Info(ui.lang.t(Key::AuditDisabled).into()));
     }
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -341,10 +348,13 @@ fn handle_agent(ui: &mut Ui, ev: Evt) {
     match ev {
         Evt::Proposal(p) => {
             // 命令提案：入待批队列，对话流里给一条提示
-            ui.items.push(Item::Info(format!(
-                "命令提案: {} = `{}`（{}），/allowcmd 审批",
-                p.name, p.command, p.mode
-            )));
+            let msg = ui
+                .lang
+                .t(Key::ProposalArrived)
+                .replacen("{}", &p.name, 1)
+                .replacen("{}", &p.command, 1)
+                .replacen("{}", &p.mode, 1);
+            ui.items.push(Item::Info(msg));
             ui.pending.push(p);
         }
         Evt::Text(t) => {
@@ -422,7 +432,7 @@ fn submit(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
         return;
     }
     if !ui.has_key {
-        ui.items.push(Item::Info("未设置 API key，请用 /setting -g key <你的key>".into()));
+        ui.items.push(Item::Info(ui.lang.t(Key::ApiKeyMissing).into()));
         return;
     }
     ui.items.push(Item::User(text.clone()));
@@ -450,15 +460,15 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
             let name = kv.next().unwrap_or("");
             let command = kv.next().unwrap_or("").trim();
             if name.is_empty() || command.is_empty() {
-                ui.items.push(Item::Info("用法: /addcmd [-g] <name> <命令全文>".into()));
+                ui.items.push(Item::Info(ui.lang.t(Key::UsageAddcmd).into()));
                 return;
             }
             if !agent_core::commands::valid_name(name) {
-                ui.items.push(Item::Info("name 只能包含字母/数字/_/-".into()));
+                ui.items.push(Item::Info(ui.lang.t(Key::BadName).into()));
                 return;
             }
             if global && agent_core::config::exe_dir().is_none() {
-                ui.items.push(Item::Info("无法定位 do.exe 目录，全局层不可用".into()));
+                ui.items.push(Item::Info(ui.lang.t(Key::NoExeDir).into()));
                 return;
             }
             ui.pending.push(ApprovedCommand {
@@ -476,7 +486,7 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
         // /allowcmd：仅打开审批页处理 AI 待批提案
         "allowcmd" => {
             if ui.pending.is_empty() {
-                ui.items.push(Item::Info("无待审批提案".into()));
+                ui.items.push(Item::Info(ui.lang.t(Key::NoPending).into()));
             } else {
                 ui.appr_sel = 0;
                 ui.appr_editing = false;
@@ -492,7 +502,7 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                     agent_core::config::exe_dir().as_deref(),
                 );
                 if cmds.is_empty() {
-                    ui.items.push(Item::Info("无已批准命令".into()));
+                    ui.items.push(Item::Info(ui.lang.t(Key::NoApproved).into()));
                 } else {
                     ui.del_list = cmds;
                     ui.del_sel = 0;
@@ -512,8 +522,12 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                                 .unwrap_or_default()
                                 .iter()
                                 .any(|c| c.name == arg);
-                            let extra = if g_has { "（全局层还有一条同名）" } else { "" };
-                            ui.items.push(Item::Info(format!("已撤销: {arg}{extra}")));
+                            let extra =
+                                if g_has { ui.lang.t(Key::AlsoInGlobal) } else { "" };
+                            ui.items.push(Item::Info(format!(
+                                "{}{extra}",
+                                ui.lang.t(Key::Revoked).replace("{}", arg)
+                            )));
                         }
                         Err(e) => ui.items.push(Item::Info(e.to_string())),
                     }
@@ -521,17 +535,19 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                 }
                 // 再查全局层
                 let Some(dir) = agent_core::config::exe_dir() else {
-                    ui.items.push(Item::Info(format!("未找到已批准命令: {arg}")));
+                    ui.items.push(Item::Info(ui.lang.t(Key::CmdNotFound).replace("{}", arg)));
                     return;
                 };
                 let mut g_cmds = agent_core::commands::load_global(&dir);
                 let before = g_cmds.len();
                 g_cmds.retain(|c| c.name != arg);
                 if g_cmds.len() == before {
-                    ui.items.push(Item::Info(format!("未找到已批准命令: {arg}")));
+                    ui.items.push(Item::Info(ui.lang.t(Key::CmdNotFound).replace("{}", arg)));
                 } else {
                     match agent_core::commands::save_global(&dir, &g_cmds) {
-                        Ok(()) => ui.items.push(Item::Info(format!("已撤销 全局: {arg}"))),
+                        Ok(()) => ui
+                            .items
+                            .push(Item::Info(ui.lang.t(Key::RevokedGlobal).replace("{}", arg))),
                         Err(e) => ui.items.push(Item::Info(e.to_string())),
                     }
                 }
@@ -544,7 +560,7 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
             agent.send(Cmd::Reset);
             ui.items.clear();
             ui.tokens = 0;
-            ui.items.push(Item::Info("已开始新对话（AI 将自行读取 HANDOFF.md 续接）".into()));
+            ui.items.push(Item::Info(ui.lang.t(Key::NewChatDone).into()));
         }
         // 裸 /setting（无参数）→ 进入独立设置页
         "setting" if arg.is_empty() => enter_settings(ui, root),
@@ -559,9 +575,7 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
             let field = kv.next().unwrap_or("");
             let value = kv.next().unwrap_or("").trim();
             if field.is_empty() || value.is_empty() {
-                ui.items.push(Item::Info(
-                    "用法: /setting [-g] <url|key|model|start> <值>（-g 写全局层）".into(),
-                ));
+                ui.items.push(Item::Info(ui.lang.t(Key::UsageSetting).into()));
                 return;
             }
             // 关键：写哪层就只读写哪层——绝不能把合并结果存回去，
@@ -572,15 +586,15 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                         let mut cfg = Config::load_global(&dir);
                         cfg.set_global(field, value)
                             .and_then(|()| cfg.save_global(&dir).map_err(|e| e.to_string()))
-                            .map(|()| format!("已更新 全局 {field}"))
+                            .map(|()| ui_lang_fmt(ui, true, field))
                     }
-                    None => Err("无法定位 do.exe 目录，全局配置层不可用".to_string()),
+                    None => Err(ui.lang.t(Key::NoExeDir).to_string()),
                 }
             } else {
                 let mut cfg = Config::load_workspace(root);
                 cfg.set(field, value)
                     .and_then(|()| cfg.save(root).map_err(|e| e.to_string()))
-                    .map(|()| format!("已更新 {field}"))
+                    .map(|()| ui_lang_fmt(ui, false, field))
             };
             match result {
                 Ok(msg) => {
@@ -590,35 +604,87 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                     if field == "key" {
                         ui.has_key = true;
                     }
+                    if field == "lang" {
+                        ui.lang = Lang::parse(value);
+                    }
                     ui.items.push(Item::Info(msg));
                 }
                 Err(e) => ui.items.push(Item::Info(e)),
             }
         }
+        // /lang：显式切换或裸命令轮换；语言是个人偏好，持久化到全局层
+        "lang" => {
+            let next = match arg {
+                "" => match ui.lang {
+                    // 裸 /lang：两种语言间轮换
+                    Lang::Zh => Lang::En,
+                    Lang::En => Lang::Zh,
+                },
+                "zh" => Lang::Zh,
+                "en" => Lang::En,
+                _ => {
+                    ui.items.push(Item::Info(ui.lang.t(Key::UsageLang).into()));
+                    return;
+                }
+            };
+            ui.lang = next;
+            let value = match next {
+                Lang::Zh => "zh",
+                Lang::En => "en",
+            };
+            // 落盘失败不阻断切换（session 内仍生效），但提示一声
+            if let Err(e) = persist_lang(value) {
+                ui.items.push(Item::Info(e));
+            }
+            // 反馈用**新**语言
+            let msg = ui.lang.t(Key::LangSet).replace("{}", ui.lang.t(Key::LangName));
+            ui.items.push(Item::Info(msg));
+        }
         // 旧名 /addc /deletec /allowc 不做别名，直接落入未知命令提示——
         // 提示里列出新名，即一行迁移指引
-        _ => ui.items.push(Item::Info(
-            "未知命令（/setting /new /addcmd /allowcmd /deletecmd /quit）".into(),
-        )),
+        _ => ui.items.push(Item::Info(ui.lang.t(Key::UnknownCmd).into())),
     }
+}
+
+/// "已更新 {field}" 反馈（按当前界面语言）
+fn ui_lang_fmt(ui: &Ui, global: bool, field: &str) -> String {
+    let key = if global { Key::UpdatedGlobalField } else { Key::UpdatedField };
+    ui.lang.t(key).replace("{}", field)
+}
+
+/// /lang 持久化：语言是个人偏好，写全局层（exe 旁 do.config.json）。
+/// 拆出 exe 目录参数是为了可测（测试喂临时目录）
+fn persist_lang(value: &str) -> Result<(), String> {
+    let dir = agent_core::config::exe_dir().ok_or_else(|| "exe dir unavailable".to_string())?;
+    persist_lang_to(&dir, value)
+}
+
+/// 实际写入：读全局层 → 改 lang → 写回
+fn persist_lang_to(dir: &Path, value: &str) -> Result<(), String> {
+    let mut cfg = Config::load_global(dir);
+    cfg.set("lang", value)?;
+    cfg.save_global(dir).map_err(|e| e.to_string())
 }
 
 /// 进入设置页：载入各字段的**生效值**（合并视图）与来源层。
 /// 修复历史 bug：旧版按"字段归属层"各读单层——若值写在工作区层
 /// （如 `/setting key` 不带 -g），全局字段行就会错误地显示"未设置"。
 /// 显示用合并值；保存纪律不变（写哪层只写哪层，见 settings_save）。
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/setting", "/setting [-g] <url|key|model|start> <值>"),
-    ("/new", "/new"),
-    ("/addcmd", "/addcmd <name> <命令全文>"),
-    ("/allowcmd", "/allowcmd 审批命令提案"),
-    ("/deletecmd", "/deletecmd [name] 撤销已批准命令"),
-    ("/quit", "/quit"),
+/// slash 命令候选表：命令名 + 用法文案 key（渲染时按当前语言取）。
+/// 命令名是英文标识符，不翻译
+const SLASH_COMMANDS: &[(&str, Key)] = &[
+    ("/setting", Key::UsageCmdSetting),
+    ("/new", Key::UsageCmdNew),
+    ("/addcmd", Key::UsageCmdAddcmd),
+    ("/allowcmd", Key::UsageCmdAllowcmd),
+    ("/deletecmd", Key::UsageCmdDeletecmd),
+    ("/lang", Key::UsageCmdLang),
+    ("/quit", Key::UsageCmdQuit),
 ];
 
 /// 按当前输入的前缀过滤候选（如 `/s` 只剩 /setting）。
 /// 返回命中的用法提示文本；输入不以 `/` 开头或无命中时为空。
-fn slash_hint(input: &str) -> String {
+fn slash_hint(input: &str, lang: Lang) -> String {
     if !input.starts_with('/') {
         return String::new();
     }
@@ -627,7 +693,7 @@ fn slash_hint(input: &str) -> String {
         // filter + map 链 ≈ C# LINQ 的 Where + Select。
         // 双向前缀：`/s` 命中 /setting；`/setting m` 也已选定命令，继续显示其用法
         .filter(|(name, _)| name.starts_with(input) || input.starts_with(name))
-        .map(|(_, usage)| *usage)
+        .map(|(_, usage)| lang.t(*usage))
         .collect::<Vec<_>>()
         .join("  ")
 }
@@ -676,30 +742,31 @@ fn format_call(name: &str, args_json: &str) -> String {
 
 /// 状态栏上方的上下文提示行：slash 候选优先，其次按模式给快捷键提示
 fn hint_text(ui: &Ui) -> String {
+    let t = |k: Key| ui.lang.t(k);
     if ui.mode == Mode::Chat {
-        let slash = slash_hint(&ui.input);
+        let slash = slash_hint(&ui.input, ui.lang);
         if !slash.is_empty() {
             return slash; // slash 输入时，候选提示保持优先
         }
     }
     match ui.mode {
-        Mode::Splash => "按任意键继续".to_string(),
+        Mode::Splash => t(Key::SplashContinue).to_string(),
         Mode::Settings => if ui.set_editing.is_some() {
-            "Enter 保存 · Esc 放弃".to_string()
+            t(Key::HintSettingsEdit).to_string()
         } else {
-            "↑↓ 选择 · Enter 编辑 · Esc 返回".to_string()
+            t(Key::HintSettings).to_string()
         },
         Mode::Approve => if ui.appr_editing {
-            "Enter 保存 · Esc 放弃".to_string()
+            t(Key::HintSettingsEdit).to_string()
         } else {
-            "↑↓ 选择 · Enter 批准 · x 拒绝 · e 编辑描述 · Esc 返回".to_string()
+            t(Key::HintApprove).to_string()
         },
-        Mode::Delete => "↑↓ 选择 · Enter 删除 · Esc 返回".to_string(),
+        Mode::Delete => t(Key::HintDelete).to_string(),
         Mode::Chat => if ui.busy {
-            "^E 展开/折叠 · Esc 取消 · ↑↓/PgUp/Dn 滚动 · ^C 退出".to_string()
+            t(Key::HintChatBusy).to_string()
         } else {
             // agent 不忙时省略 Esc 项（此时 Esc 不响应）
-            "^E 展开/折叠 · ↑↓/PgUp/Dn 滚动 · ^C 退出".to_string()
+            t(Key::HintChatIdle).to_string()
         },
     }
 }
@@ -782,7 +849,12 @@ fn draw(term: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &Ui) -> io::Resul
         }
 
         // 状态栏：~N tok | model | 工作区
-        let status = format!("~{} tok | {} | {}", ui.tokens, ui.model, ui.workspace);
+        let model = if ui.model.is_empty() {
+            ui.lang.t(Key::ModelUnset)
+        } else {
+            &ui.model
+        };
+        let status = format!("~{} tok | {} | {}", ui.tokens, model, ui.workspace);
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
             chunks[3],
@@ -809,9 +881,14 @@ fn build_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
             Item::Reasoning { text, open } => {
                 let style = Style::default().fg(Color::DarkGray);
                 if ui.expand_all || *open {
-                    push_styled(&mut out, &format!("思考: {text}"), w, style);
+                    let line = ui.lang.t(Key::ThinkingOpen).replace("{}", text);
+                    push_styled(&mut out, &line, w, style);
                 } else {
-                    push_styled(&mut out, &format!("思考 (+{} 字)", text.chars().count()), w, style);
+                    let line = ui
+                        .lang
+                        .t(Key::ThinkingFolded)
+                        .replace("{}", &text.chars().count().to_string());
+                    push_styled(&mut out, &line, w, style);
                 }
             }
             Item::Tool { name, args, result } => {
@@ -820,8 +897,9 @@ fn build_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
                 let style = Style::default().fg(Color::Cyan);
                 let (word, word_style) = match result {
                     None => (ellipsis_frame(ui.tick_count), Style::default().fg(Color::Yellow)),
+                    // CANCEL_MARK 是逻辑比较用的内部常量，展示按语言取
                     Some(r) if r == CANCEL_MARK => {
-                        (CANCEL_MARK, Style::default().fg(Color::Red))
+                        (ui.lang.t(Key::Cancelled), Style::default().fg(Color::Red))
                     }
                     Some(_) => ("done", Style::default().fg(Color::Green)),
                 };
@@ -840,7 +918,12 @@ fn build_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
                 }
             }
             Item::Info(t) => push_styled(&mut out, t, w, Style::default().fg(Color::DarkGray)),
-            Item::Error(t) => push_styled(&mut out, &format!("错误: {t}"), w, Style::default().fg(Color::Red)),
+            Item::Error(t) => push_styled(
+                &mut out,
+                &ui.lang.t(Key::ErrorPrefix).replace("{}", t),
+                w,
+                Style::default().fg(Color::Red),
+            ),
         }
     }
     out
@@ -919,6 +1002,7 @@ fn test_ui() -> Ui {
         scroll: 0,
         expand_all: false,
         tokens: 0,
+        lang: Lang::Zh,
         model: String::new(),
         has_key: false,
         workspace: String::new(),
@@ -946,18 +1030,18 @@ mod tests {
 
     #[test]
     fn slash_hint_filters_by_prefix() {
-        assert!(slash_hint("").is_empty()); // 非 / 开头无提示
-        assert!(slash_hint("abc").is_empty());
-        assert!(slash_hint("/x").is_empty()); // 无命中
+        assert!(slash_hint("", Lang::Zh).is_empty()); // 非 / 开头无提示
+        assert!(slash_hint("abc", Lang::Zh).is_empty());
+        assert!(slash_hint("/x", Lang::Zh).is_empty()); // 无命中
         // `/s` 只剩 /setting
-        assert_eq!(slash_hint("/s"), "/setting [-g] <url|key|model|start> <值>");
+        assert_eq!(slash_hint("/s", Lang::Zh), "/setting [-g] <url|key|model|start|lang> <值>");
         // `/` 显示全部候选
-        let all = slash_hint("/");
+        let all = slash_hint("/", Lang::Zh);
         assert!(all.contains("/setting") && all.contains("/new") && all.contains("/quit"));
         // 已选定命令继续敲参数时仍显示其用法
-        assert!(slash_hint("/setting model g").contains("/setting"));
+        assert!(slash_hint("/setting model g", Lang::Zh).contains("/setting"));
         // 完整命令名命中自身
-        assert_eq!(slash_hint("/new"), "/new");
+        assert_eq!(slash_hint("/new", Lang::Zh), "/new");
     }
 
     #[test]
@@ -1127,6 +1211,56 @@ mod tests {
         assert_eq!(ui.pending.len(), 1);
         assert_eq!(ui.pending[0].name, "dev");
         assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("/allowcmd")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lang_slash_rotate_set_and_persist() {
+        let dir = std::env::temp_dir().join(format!("doagent-lang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut agent = AgentHandle::start(&dir).unwrap();
+        let mut ui = test_ui(); // 夹具默认 Zh
+        // 显式设置
+        slash(&mut ui, &mut agent, &dir, "lang en");
+        assert_eq!(ui.lang, Lang::En);
+        // 反馈用新语言
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("English")));
+        // 裸 /lang 轮换
+        slash(&mut ui, &mut agent, &dir, "lang");
+        assert_eq!(ui.lang, Lang::Zh);
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("中文")));
+        // 未知参数给用法提示
+        slash(&mut ui, &mut agent, &dir, "lang fr");
+        assert_eq!(ui.lang, Lang::Zh); // 不变
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("/lang [zh|en]")));
+        // 清理：slash 路径会写真实 exe 旁的 do.config.json
+        if let Some(d) = agent_core::config::exe_dir() {
+            let _ = std::fs::remove_file(d.join("do.config.json"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_lang_writes_global_layer() {
+        // 持久化目标层：写进给定目录的 do.config.json（全局层）
+        let dir = std::env::temp_dir().join(format!("doagent-lang2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        persist_lang_to(&dir, "zh").unwrap();
+        let cfg = Config::load_global(&dir);
+        assert_eq!(cfg.lang, "zh");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lang_switch_changes_ui_text() {
+        // 切换 lang 后 hint 与 slash 候选提示语言变化
+        let mut ui = test_ui(); // 夹具默认 Zh
+        assert!(hint_text(&ui).contains("展开/折叠"));
+        ui.lang = Lang::En;
+        assert!(hint_text(&ui).contains("expand/collapse"));
+        assert_eq!(slash_hint("/s", Lang::En), "/setting [-g] <url|key|model|start|lang> <value>");
+        assert!(slash_hint("/s", Lang::Zh).contains("<值>"));
     }
 
     #[test]

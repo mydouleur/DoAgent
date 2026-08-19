@@ -17,6 +17,7 @@
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 
+mod lang;
 mod md;
 mod tui;
 

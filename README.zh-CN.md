@@ -79,10 +79,11 @@ do
 
 | 输入 | 作用 |
 |---|---|
-| `/setting [-g] <url\|key\|model\|start> <值>` | 改配置（带 `-g` 写全局） |
+| `/setting [-g] <url\|key\|model\|start\|lang> <值>` | 改配置（带 `-g` 写全局；`lang` 可选 `zh`\|`en`） |
 | `/new` | 新对话（AI 自行读取 HANDOFF.md 续接） |
 | `/addcmd <name 命令>` | 自助注册白名单命令（仍过审批页确认） |
 | `/allowcmd` / `/deletecmd [name]` | 审批 AI 提案 / 撤销白名单命令 |
+| `/lang [zh\|en]` | 切换界面语言（裸命令轮换；写全局层） |
 | `/quit` 或 `Ctrl+C` | 退出 |
 | `Ctrl+E` | 展开/折叠思考过程与工具调用 |
 | `PageUp / PageDown` | 滚动历史 |
