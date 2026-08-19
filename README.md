@@ -17,7 +17,7 @@
 
 An AI coding tool built on subtraction — zero dependencies, drop in and go, delete and it's gone
 
-**English** | [中文](README.zh-CN.md)
+**English** | [中文](README.zh-CN.md) · 📖 [User Guide](docs/USER_GUIDE.md) | [使用文档](docs/USER_GUIDE.zh-CN.md)
 
 </div>
 
@@ -28,24 +28,56 @@ An AI coding tool built on subtraction — zero dependencies, drop in and go, de
 > **AI proposes, you dispose. Give programming back to programmers.**
 
 Most AI dev tools keep adding: they take over your shell, your git, your whole workflow.
-DoAgent subtracts — it has only 6 tools, never touches shell, never touches git, and does nothing "clever" behind your back.
+DoAgent subtracts — a fixed set of 7 tools, no free shell, no git, nothing "clever" behind your back.
 It helps you write code. **Control stays with you.**
 
-- **Featherweight**: a single static binary, ~3 MB, millisecond cold start
+- **Featherweight**: a single static binary, ~2–3 MB, millisecond cold start
 - **Runs anywhere**: servers, Docker, edge devices — `scp` it over and it works
 - **Truly portable**: the program and its config live in one folder; uninstall = delete the folder, zero residue
 
-## Only 6 built-in tools
+## Install
+
+Linux / macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mydouleur/DoAgent/main/install.sh | sh
+```
+
+The script detects your OS/arch (and on Linux picks the musl static build unless your system has OpenSSL 3), downloads the latest release, and installs to `/usr/local/bin` or `~/.local/bin`.
+
+Windows: download `do-windows-x86_64.exe` from [Releases](https://github.com/mydouleur/DoAgent/releases), drop it into a folder on your PATH.
+
+## Quick start
+
+```bash
+cd your-project
+do
+```
+
+```
+/setting -g url https://your-openai-compatible-endpoint
+/setting -g key sk-xxxxxxxx
+/setting -g model your-model
+/setting start cargo build      ← how this project compiles (workspace layer)
+```
+
+Then just talk: "check the error in src/main.rs".
+
+## 7 fixed tools — nothing more
 
 | Tool | What it does |
 |---|---|
 | `read` / `write` / `edit` | read, write, and patch files |
 | `ls` / `grep` | list directories, search content |
-| `addcmd` / `runcmd` | propose / list & run whitelisted commands (see below) |
+| `runcmd` | list and run **approved** fixed commands |
+| `addcmd` | AI proposes a new fixed command — nothing runs until you approve it |
 
-No free-form shell.
+No bash. The AI's only execution channel is the whitelist **you** approved:
 
-**Command whitelist**: the AI can *propose* fixed commands with `addcmd` (e.g. `npm run dev`), but nothing executes until you approve them with `/addcmd`. Approved commands live in `.do/commands.json`; the AI discovers and invokes them through the `runcmd` tool (`runcmd()` lists, `runcmd("name")` runs) — the approved string is all that ever runs, no parameters, always in the workspace root. Your configured `start` command shows up as an implicit whitelist entry. `/deletecmd` revokes.
+- AI proposes via `addcmd` → you review with `/allowcmd` (list view, Enter to approve)
+- Self-register with `/addcmd <name> <command>` (add `-g` for all projects)
+- Revoke anytime with `/deletecmd`
+- Approvals live in `.do/commands.json` — a directory the AI cannot even see
 
 ## Safety: the workspace is the boundary
 
@@ -53,60 +85,48 @@ No free-form shell.
 - The config dir `.do/` is **completely invisible** to the AI — reads report "file not found", `ls` omits it, `grep` skips it
 - Global config sits next to the binary, physically outside the workspace, out of the AI's reach
 
-## Quick start
+## Audit: every action, on record
 
-```bash
-# 1. Drop do into a fixed directory (e.g. C:\tools or /usr/local/bin) and add it to PATH
-# 2. Launch inside any project directory
-do
-# macOS Gatekeeper (first run): xattr -d com.apple.quarantine do
-```
-
-**Downloads & TLS**: Windows uses Schannel, macOS uses Security.framework, and regular Linux (gnu) uses the system OpenSSL — pick `do-linux-x86_64-musl` as the universal Linux build (statically linked rustls; runs on Alpine/distroless/old distros with no system TLS at all).
-
-```
-/setting -g url https://your-openai-compatible-endpoint
-/setting -g key sk-xxxxxxxx
-/setting -g model your-model
-/setting start cargo build      ← tell it how this project compiles
-```
-
-Then just talk: "check the error in src/main.rs".
+Everything is appended to `do.audit.jsonl` next to the binary — your inputs, each AI reply, every tool call (name, args, duration, result tail).
+It lives **outside the workspace**, so the AI can neither forge nor erase its own trail. Plain JSONL: open it in any editor.
 
 ## Commands & keys
 
 | Input | Action |
 |---|---|
-| `/setting [-g] <url\|key\|model\|start\|lang> <value>` | change config (`-g` writes the global layer; `lang` = `zh`\|`en`) |
+| `/setting [-g] <url\|key\|model\|start\|lang> <value>` | change config (`-g` writes the global layer); bare `/setting` opens the settings page |
+| `/lang [zh\|en]` | switch UI language (bare toggles) |
 | `/new` | new conversation (AI re-reads HANDOFF.md itself) |
-| `/addcmd <name 命令>` | self-register a whitelisted command (confirms in the approval page) |
-| `/allowcmd` / `/deletecmd [name]` | approve AI proposals / revoke whitelisted commands |
-| `/lang [zh\|en]` | switch UI language (bare = toggle; saved to the global layer) |
-| `/quit` or `Ctrl+C` | exit |
+| `/addcmd <name> <command>` | self-register a whitelisted command |
+| `/allowcmd` / `/deletecmd [name]` | approve AI proposals / revoke |
+| `Esc` | cancel the current turn |
 | `Ctrl+E` | expand/collapse thinking & tool calls |
-| `PageUp / PageDown` | scroll history |
+| `↑↓` / `PageUp / PageDown` | scroll (fine / coarse) |
+| `Ctrl+C` or `/quit` | exit |
 
-## Config: two layers, two jobs
+## Config: layers, each with one job
 
 | Layer | Location | Holds |
 |---|---|---|
-| Workspace (wins) | `project/.do/config.json` | `start` + per-project overrides |
-| Global (portable) | `do.config.json` next to the binary | `url` / `key` / `model` |
-
-The command whitelist is two-layered the same way: `do.commands.json` next to the binary (global, `/addcmd -g`) plus `project/.do/commands.json` (workspace wins on name clashes). `runcmd` lists both with a source tag. AI proposals always land in the workspace layer — the AI can never grant itself a cross-project command.
-
-## Audit
-
-Every session appends to `do.audit.jsonl` next to the binary — one JSON record per line: user inputs, tool calls (name, args, duration, result tail), and per-round token estimates. It lives **outside** the workspace on purpose: the AI's tools are locked to the workspace root, so it cannot forge or erase its own track record. If the file isn't writable the audit silently disables itself (with a one-line notice at startup).
-
-Set your identity once globally; each project only needs its `start` command.
-Need a different key for one project? `/setting key ...` (no `-g`) overrides it there.
+| Workspace (wins) | `project/.do/config.json` + `.do/commands.json` | `start`, per-project overrides, project commands |
+| Global (portable) | `do.config.json` + `do.commands.json` next to the binary | `url` / `key` / `model` / `lang`, cross-project commands |
 
 ## Context: /new is the compaction
 
-No black-box auto-summaries. The AI is instructed to maintain a `HANDOFF.md` (goal / progress / decisions / next step).
+No black-box auto-summaries. The AI maintains a `HANDOFF.md` (goal / progress / decisions / next step).
 Watch the token estimate in the status bar; when you decide it's time, `/new` —
 history clears, and the AI re-reads the handoff doc on its own. **You decide when to compact.**
+
+## Platform builds & TLS
+
+| Asset | TLS |
+|---|---|
+| `do-windows-x86_64.exe` | Schannel (system) |
+| `do-macos-aarch64` / `do-macos-x86_64` | Security.framework (system) |
+| `do-linux-x86_64` | system OpenSSL 3 |
+| `do-linux-x86_64-musl` | bundled rustls — **the universal build, runs on any Linux** |
+
+macOS first run: `xattr -d com.apple.quarantine do` (the install script does this for you).
 
 ## Uninstall
 
