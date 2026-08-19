@@ -36,7 +36,8 @@ pub struct Config {
     pub key: String,
     /// 模型名
     pub model: String,
-    /// start 工具要执行的那一条命令（可含空格；项目级，不进全局层）
+    /// 配置的启动/构建命令（可含空格；项目级，不进全局层）。
+    /// 不再是独立工具：非空时作为隐式条目并入 runcmd 的白名单视图
     pub start: String,
 }
 

@@ -1,4 +1,4 @@
-//! 6 个 AI 工具：read / write / edit / ls / grep / start
+//! 7 个 AI 工具：read / write / edit / ls / grep / addcmd / runcmd（数组冻结）
 //!
 //! # 模块导读
 //! 每个工具 = 一个参数 schema（发给模型的 JSON Schema）+ 一个执行函数。
@@ -7,7 +7,7 @@
 //! 只有 write 报 Windows 权限拒绝（os error 5）。
 //!
 //! # 源头截断（上下文管理第一条）
-//! read 限 400 行、ls 限 200 条、grep 限 100 条匹配、start 限尾部 20 KB——
+//! read 限 400 行、ls 限 200 条、grep 限 100 条匹配、runcmd 限尾部 20 KB——
 //! 超限直接在源头掐断，只把截断后的内容送回模型。
 
 use crate::commands::ApprovedCommand;

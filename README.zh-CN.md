@@ -61,7 +61,10 @@ DoAgent 做减法——它只有 6 个工具，不碰 shell，不碰 git，不�
 # 1. 放到一个固定目录（比如 C:\tools），加进 PATH
 # 2. 任意项目目录里启动
 do
+# macOS 首次运行解 Gatekeeper：xattr -d com.apple.quarantine do
 ```
+
+**下载与 TLS**：Windows 用系统 Schannel，macOS 用 Security.framework，常规 Linux（gnu 版）用系统 OpenSSL（OpenSSL 3 系发行版）；`do-linux-x86_64-musl` 是**通用版**——静态链接 rustls，Alpine / distroless / 老发行版都能跑。
 
 ```
 /setting -g url https://你的OpenAI兼容API地址

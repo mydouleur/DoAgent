@@ -3,15 +3,28 @@ name = "core"
 version = "0.1.0"
 edition = "2021"
 
-# 核心库：工作区守卫、6 工具、SSE 流式 API、agent 循环、配置。
+# 核心库：工作区守卫、7 工具、SSE 流式 API、agent 循环、双层配置、命令白名单。
 # 对 TUI 只暴露 actor 消息通道（见 lib.rs）。
 
 [dependencies]
 tokio.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 eventsource-stream.workspace = true
 futures-util.workspace = true
 regex-lite.workspace = true
 ignore.workspace = true
+
+# TLS 平台分叉（教学点：Cargo 按 target 条件依赖）
+# ≈ C# 里按 RID 条件引用不同 NuGet 包。为什么这样分：
+# - Windows / macOS / 常规 Linux(gnu)：用操作系统自带的 TLS
+#   （Schannel / Security.framework / 系统 OpenSSL），经 reqwest 的
+#   native-tls feature——少静态链接一整份 rustls+ring，体积小约 1 MB
+# - Linux-musl：静态链接的"通用兜底版"，目标系统可能完全没有 OpenSSL
+#   （Alpine、distroless），必须自带 TLS 栈 → 保留 rustls-tls(ring)
+# 业务代码零改动：reqwest 把 TLS 栈抽象掉了。
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+reqwest = { workspace = true, features = ["rustls-tls"] }
+
+[target.'cfg(not(all(target_os = "linux", target_env = "musl")))'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }

@@ -59,7 +59,10 @@ No free-form shell.
 # 1. Drop do into a fixed directory (e.g. C:\tools or /usr/local/bin) and add it to PATH
 # 2. Launch inside any project directory
 do
+# macOS Gatekeeper (first run): xattr -d com.apple.quarantine do
 ```
+
+**Downloads & TLS**: Windows uses Schannel, macOS uses Security.framework, and regular Linux (gnu) uses the system OpenSSL — pick `do-linux-x86_64-musl` as the universal Linux build (statically linked rustls; runs on Alpine/distroless/old distros with no system TLS at all).
 
 ```
 /setting -g url https://your-openai-compatible-endpoint

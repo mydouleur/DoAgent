@@ -48,6 +48,14 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             name: do-linux-x86_64-musl
+          # macOS Apple Silicon
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: do-macos-aarch64
+          # macOS Intel
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: do-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +67,14 @@ jobs:
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      # TLS 冒烟：TLS 栈按平台分叉（native-tls / rustls），本地验证不了
+      # 握手，所以每个构建都拿真二进制打一次真实 HTTPS 端点
+      - name: TLS smoke
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/do"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          "$BIN" --check-net https://github.com
       # 统一产物名：Windows 产物带 .exe，其余不带
       - name: Package
         shell: bash

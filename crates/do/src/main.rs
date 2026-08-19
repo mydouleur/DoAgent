@@ -22,6 +22,21 @@ mod tui;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // 隐藏启动参数：do --check-net <url> —— CI 的 TLS 冒烟入口。
+    // 只做一次 GET 打印状态码后退出，不进 TUI（≈ C# 的 Main 前置分支）
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("--check-net") {
+        let url = args.get(2).map(|s| s.as_str()).unwrap_or("https://github.com");
+        match agent_core::check_net(url).await {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // panic hook：进程 abort 前最后的机会，把终端还给用户
     std::panic::set_hook(Box::new(|_| {
         let _ = disable_raw_mode();

@@ -56,7 +56,9 @@ pub enum Evt {
     Text(String),
     /// 思考增量（流式）
     Reasoning(String),
-    /// 一次工具调用完成（附截断后的结果）
+    /// 一次工具调用即将派发（进行中态；TUI 立即显示，不等结果）
+    ToolStart { name: String, args: String },
+    /// 一次工具调用完成（附截断后的结果；更新 ToolStart 创建的块）
     Tool {
         name: String,
         args: String,
@@ -182,11 +184,19 @@ async fn chat_round(
     for _ in 0..16 {
         // 生效配置 = 工作区层 > 全局便携层 > 默认；current_exe 失败自动降级
         let cfg = Config::load_merged(ws.root(), crate::config::exe_dir().as_deref());
-        // 回调把流式增量就地转成事件推给 TUI
+        // 回调把流式增量就地转成事件推给 TUI。
+        // announced 记录哪些 tool_call 已在流式中段宣告过（ToolBegin），
+        // 供下方派发阶段判重——同一次调用不许出两个 doing 块
+        let mut announced = std::collections::HashSet::new();
         let reply = api::chat(&cfg, messages, defs, cancel, |d| {
             let _ = match d {
                 api::Delta::Text(t) => evt.send(Evt::Text(t)),
                 api::Delta::Reasoning(r) => evt.send(Evt::Reasoning(r)),
+                api::Delta::ToolBegin(idx, name) => {
+                    announced.insert(idx);
+                    // args 还没拼完，先空串——TUI 显示 read() doing.
+                    evt.send(Evt::ToolStart { name, args: String::new() })
+                }
             };
         })
         .await;
@@ -216,12 +226,20 @@ async fn chat_round(
         // 有工具调用：先把 assistant 的调用请求原样入列（协议要求）
         messages.push(assistant_msg(&reply));
         // 顺序执行每个工具，结果以 role=tool 消息入列
-        for tc in &reply.tool_calls {
+        for (call_idx, tc) in reply.tool_calls.iter().enumerate() {
             // 取消检查点②：每次工具执行前看标志。置位则不执行，
             // 但仍回填一条 tool 结果——协议要求每个 tool_call 都有应答
             let result = if cancel.load(Ordering::Relaxed) {
                 "（已取消）".to_string()
             } else {
+                // 派发前先发 ToolStart：TUI 立即显示进行中块，不等结果。
+                // 流式中段已通过 ToolBegin 宣告过的不再重发（判重）
+                if !announced.contains(&call_idx) {
+                    let _ = evt.send(Evt::ToolStart {
+                        name: tc.name.clone(),
+                        args: tc.arguments.clone(),
+                    });
+                }
                 match check_call(&tc.name, &tc.arguments) {
                     // 参数校验失败：不执行工具，把明确错误回填给模型
                     // （自愈原则：模型知道自己错在哪，下一轮会修正）

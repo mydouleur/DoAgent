@@ -49,6 +49,23 @@ pub enum Delta {
     Text(String),
     /// 思考增量
     Reasoning(String),
+    /// 某个 tool_call 的名字**首次**出现（index, name）。
+    /// 教学点：流式协议里 name 在第一帧就到，arguments 才是一点点拼的。
+    /// 一拿到名字就宣告 ≈ C# 里 IO 一开始就显示进度条，而不是等完成——
+    /// 长回复（如 write 大文件）期间用户能看到"正在调用谁"。
+    ToolBegin(usize, String),
+}
+
+/// HTTPS 冒烟（CI 用）：GET 一次返回状态码。
+/// 用途：TLS 栈按平台分叉（Schannel/Security.framework/OpenSSL/rustls）后，
+/// CI 对每个已发布二进制跑一次，验证该平台 TLS 握手真的通。
+pub async fn check_net(url: &str) -> Result<String, String> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("HTTP {} {}", resp.status().as_u16(), url))
 }
 
 /// 把工具定义转成 API 请求里的 tools 数组
@@ -137,7 +154,11 @@ pub async fn chat(
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for tc in calls {
-                    acc.push_tool_call(tc);
+                    // 累加器返回 Some((index, name)) 表示该 index 第一次拿到
+                    // 名字——立刻宣告，让用户在流式中段就看到工具调用
+                    if let Some((idx, name)) = acc.push_tool_call(tc) {
+                        on_delta(Delta::ToolBegin(idx, name));
+                    }
                 }
             }
         }
@@ -153,7 +174,9 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    fn push_tool_call(&mut self, tc: &Value) {
+    /// 喂入一帧 tool_call 增量。返回值：该 index **首次**拿到名字时为
+    /// `Some((index, name))`（供上层提前宣告工具调用），其余为 None。
+    fn push_tool_call(&mut self, tc: &Value) -> Option<(usize, String)> {
         // index 缺失时按 0 处理（个别实现的怪癖）
         let idx = tc["index"].as_u64().unwrap_or(0) as usize;
         // 归堆：index 指向的槽位不够就补默认实例
@@ -165,13 +188,19 @@ impl Accumulator {
         if let Some(id) = tc["id"].as_str() {
             slot.id.push_str(id);
         }
+        let mut first_named = None;
         if let Some(name) = tc["function"]["name"].as_str() {
+            // 槽位原本没名字 → 这是该调用的首次宣告
+            if slot.name.is_empty() {
+                first_named = Some((idx, name.to_string()));
+            }
             slot.name.push_str(name);
         }
         // arguments 是真正的增量片段，无脑拼接
         if let Some(args) = tc["function"]["arguments"].as_str() {
             slot.arguments.push_str(args);
         }
+        first_named
     }
 }
 
@@ -185,10 +214,29 @@ mod tests {
         let mut acc = Accumulator::default();
         for f in frames {
             for tc in f["tool_calls"].as_array().into_iter().flatten() {
-                acc.push_tool_call(tc);
+                let _ = acc.push_tool_call(tc);
             }
         }
         acc.reply
+    }
+
+    #[test]
+    fn first_name_announced_exactly_once() {
+        // name 只在首帧出现：第一次推入返回 Some，后续碎片帧返回 None
+        let mut acc = Accumulator::default();
+        let first = acc.push_tool_call(
+            &json!({"index":0,"id":"c1","function":{"name":"read","arguments":"{\"pa"}}),
+        );
+        assert_eq!(first, Some((0, "read".to_string())));
+        let second = acc.push_tool_call(
+            &json!({"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}),
+        );
+        assert_eq!(second, None);
+        // 交错 index 1 的首次出现也要宣告
+        let third = acc.push_tool_call(
+            &json!({"index":1,"id":"c2","function":{"name":"ls","arguments":"{}"}}),
+        );
+        assert_eq!(third, Some((1, "ls".to_string())));
     }
 
     #[test]

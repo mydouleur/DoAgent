@@ -11,7 +11,9 @@ members = ["crates/core", "crates/do"]
 
 [workspace.dependencies]
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "process", "time", "io-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+# TLS 栈按 target 分叉（见 crates/core/Cargo.toml 的教学注释），
+# 这里只声明公共部分，TLS feature 在子 crate 按 cfg 加
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 eventsource-stream = "0.2"

@@ -3,7 +3,7 @@
 //! # 模块导读
 //! 这里聚合全部"后端"能力：
 //! - [`workspace`] 工作区守卫：路径归一 + 根内校验 + `.do/` 隐形
-//! - [`tools`]     6 个 AI 工具（read/write/edit/ls/grep/start）
+//! - [`tools`]     7 个 AI 工具（read/write/edit/ls/grep/addcmd/runcmd，数组冻结）
 //! - [`api`]       OpenAI 兼容 API 的 SSE 流式客户端 + tool_calls 累加器
 //! - [`config`]    `.do/config.json` 的读写
 //! - [`agent`]     agent 对话循环（actor 模式：消息进、事件出）
@@ -23,4 +23,5 @@ pub mod workspace; // pub 给集成测试复用
 // `pub use` 把深层模块里的类型"再导出"到 crate 根部，
 // 外部就可以写 `core::AgentHandle` 而不是 `core::agent::AgentHandle`。
 pub use agent::{AgentHandle, Cmd, Evt, ToolCall, SYSTEM_PROMPT};
+pub use api::check_net; // CI 冒烟入口（do --check-net <url>）
 pub use commands::ApprovedCommand;

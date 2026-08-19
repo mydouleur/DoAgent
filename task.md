@@ -93,12 +93,8 @@ tools 数组永远冻结为这 7 个：prompt 缓存按 system + tools + message
 
 - **v0.2 批次（待思考 1-7）**：Markdown 全量渲染（pulldown-cmark，+194 KB）；思考流式可见/正文开始自动折叠；启动 splash；/setting 独立设置页（key 掩码）；工具调用函数样式 `read("src/main.rs")`；Esc 取消；参数校验失败回填模型自愈
 - **待思考 8（命令白名单）**：AI 用 `addcmd` 工具提案、人类 `/allowcmd` 审批（列表视图）/ `/deletecmd` 撤销、人类也可 `/addcmd <name> <命令>` 自助注册；批准落盘 `.do/commands.json`（对 AI 隐形）；**发现式注入**——tools 数组冻结为固定 7 个（read/write/edit/ls/grep/addcmd/runcmd），白名单经 `runcmd` 列出与执行，批准动作零缓存代价；start 独立工具弃用（config.start 并入白名单视图）
+- **待办 1-6 批次**：①/setting 页显示 bug 修复——设置页改显示合并生效值并标注来源层（工作区/全局/默认），保存仍按"写哪层只写哪层"；②start 残留清理（tools/lib/config 文档与截断说明统一为 runcmd）；③splash 自动跳过修复——select! 条件定时分支改 tick 心跳（crossterm poll 100ms + 截止时间判断，纯函数可测；后改为 splash 仅按键进入，tick 只驱动 doing 动画帧）；④工具调用即时显示——新增 `Evt::ToolStart`，派发即插入进行中块，结果到来按序更新，取消时遗留块标"（已取消）"；状态字 doing（黄、500ms 点号动画）/ done（绿）/ 已取消（红）分色；⑤TLS 平台分叉——Windows/macOS/gnu 用 native-tls（Schannel/Security.framework/系统 OpenSSL），musl 保留 rustls，新增 `do --check-net <url>` 冒烟入口，CI 每个构建 job 跑 HTTPS 冒烟；Windows 体积 2.78 → 1.95 MB；⑥CI 矩阵加 macOS（aarch64 + x86_64），README 补 Gatekeeper 与各平台 TLS 来源说明，tui.rs 拆为 tui/{mod,pages,forms}（纯结构搬迁）
 
 ## 待办（之后处理，现在不动手）
 
-1. **/setting 页面还有 bug**（现象待补录）
-2. **start 清理不完全**：弃用 start 独立工具后仍有残留引用/语义待排查（文档、提示文案、隐式条目边界）
-3. **splash 页美化 + 展示时长调整**（排版打磨；1.2s 自动跳过的时长再斟酌）
-4. **TLS 平台分叉（已拍板方向，待实施）**：仅 musl 版保留 rustls 静态链接（通用兜底，任何 Linux 可跑），Windows（Schannel）/ macOS（Security.framework）/ Linux-gnu（系统 OpenSSL）改用 `native-tls`。reqwest 已抽象 TLS 栈，业务代码零改动，只是 Cargo 按 target 条件分 feature（`cfg(all(target_os="linux", target_env="musl"))` 分区）。预期：win/mac ~1.8 MB、gnu ~2.1 MB、musl 仍 3.2 MB（体积倒挂合理：通用性用体积买）。注意：①gnu 版变成 OpenSSL 3 系发行版专用，README 需写明"musl = 通用版"；②Cargo.lock 会锁两套 TLS 依赖；③**本地无法验证 HTTPS 握手**（网络原因），CI 必须加一步对已发布二进制请求可达 HTTPS 端点（如 github.com）的冒烟
-5. **CI 矩阵加 macOS**：`macos-latest`（aarch64）+ 可选 `macos-13`（x86_64 Intel）；ring 直接编译无需额外工具链；README 补一行 Gatekeeper 说明（`xattr -d com.apple.quarantine do`）；v0.2.0 发版时顺手做
-6. **代码清理**：tui.rs 近千行可按页面拆模块；try.cmd 注释改英文（cmd.exe 不认 UTF-8 无 BOM，中文注释会被当命令执行）
+（空）

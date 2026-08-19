@@ -1,18 +1,23 @@
-//! TUI：启动画面 + 对话流 + 输入 + slash 命令 + 设置页 + 状态栏
+//! TUI：启动画面 + 对话流 + 输入 + slash 命令 + 状态栏（模块根）
 //!
 //! # 模块导读
-//! 单事件循环驱动一切：crossterm 的键盘事件由一个专用线程转发进
-//! tokio channel，与 agent actor 的事件、splash 定时器在
+//! 单事件循环驱动一切：crossterm 的键盘事件由一个专用线程以
+//! poll(100ms) 心跳转发进 tokio channel，与 agent actor 的事件在
 //! `tokio::select!` 里汇合——全部非阻塞等待，单线程 runtime 够用。
 //!
-//! # 三种界面模式（[`Mode`]）
-//! - Splash：启动画面，logo + 版本 + 配置状态；任意键或 ~1.2s 自动进入对话
+//! # 子模块拆分（纯结构搬迁，行为不变）
+//! - `pages`：各全屏页面的渲染（splash / 设置页 / 审批页 / 删除页）
+//! - `forms`：各页面的按键处理与落盘动作（设置保存、批准/拒绝/删除）
+//! - 本文件：界面模式与状态、主循环、对话流渲染、slash 命令
+//!
+//! # 界面模式（[`Mode`]）
+//! - Splash：启动画面，logo + 版本 + 配置状态；按任意键进入对话
 //! - Chat：对话主界面（流式正文/思考/工具调用、slash 命令、Esc 取消）
-//! - Settings：/setting 独立设置页（↑↓ 选字段、Enter 编辑、Esc 返回）
+//! - Settings / Approve / Delete：/setting、/allowcmd、/deletecmd 三个页面
 //!
 //! # 交互约定（Chat 模式）
 //! - Enter 发送；Ctrl+C 退出；Esc 取消当前轮（仅 agent 工作时响应）；
-//!   Ctrl+E 全部展开/折叠；↑↓ 或 PageUp/PageDown 滚动。
+//!   Ctrl+E 全部展开/折叠；PageUp/PageDown 滚动。
 //! - 配色：思考灰、工具青、正文默认色。折叠块只显示一行摘要。
 //! - 底部两行：快捷键提示行（上下文感知）+ 状态栏 `~N tok | model | 工作区`。
 //!
@@ -22,6 +27,8 @@
 //! - 生命周期标注 `'static`：ratatui 的 `Line<'a>` 借用文本；
 //!   我们全部用 `String`（拥有所有权），所以是 `Line<'static>`，
 //!   不与缓冲区抢借用，渲染代码因此简单很多。
+//! - 子模块可见性：`pub(super)` ≈ C# 的 internal——只对父模块 tui 可见，
+//!   子模块可以直接看到父模块的私有项（Rust 的可见性向下渗透）。
 
 use agent_core::config::Config;
 use agent_core::{AgentHandle, ApprovedCommand, Cmd, Evt};
@@ -31,29 +38,21 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::{Frame, Terminal};
+use ratatui::Terminal;
 use std::io;
 use std::path::Path;
 use unicode_width::UnicodeWidthChar;
 
-/// task.md 末尾的 ASCII logo（逐字内嵌，含行尾空格）
-const LOGO: &str = "\
-░████                        ░███████              ░████ 
-░██   ░██                    ░██   ░██               ░██ 
-░██    ░██                   ░██    ░██  ░███████    ░██ 
-░██     ░██                  ░██    ░██ ░██    ░██   ░██ 
-░██    ░██                   ░██    ░██ ░██    ░██   ░██ 
-░██   ░██                    ░██   ░██  ░██    ░██   ░██ 
-░██           ░██████████    ░███████    ░███████    ░██ 
-░██                                                  ░██ 
-░████                                              ░████ 
-                                                         ";
+mod forms;
+mod pages;
 
-/// 五种界面模式
+use forms::{approve_key, delete_key, enter_settings, settings_key};
+use pages::{approve_lines, delete_lines, draw_splash, settings_lines};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     /// 启动画面：任意键或定时器自动跳过，不强制等待
@@ -75,8 +74,10 @@ enum Item {
     /// 思考过程。流式期间 open=true 实时可见（等待时能看到进展）；
     /// 正文一开始输出就自动折叠为一行摘要
     Reasoning { text: String, open: bool },
-    /// 一次工具调用：args 是**原始 JSON 字符串**，展示层决定怎么渲染
-    Tool { name: String, args: String, result: String },
+    /// 一次工具调用：args 是**原始 JSON 字符串**，展示层决定怎么渲染。
+    /// result = None 表示进行中（ToolStart 已发、结果未回），
+    /// 渲染为 doing 动画；取消时遗留的进行中块会被标成"（已取消）"。
+    Tool { name: String, args: String, result: Option<String> },
     /// 正文回复（流式增长，经 Markdown 渲染）
     Assistant(String),
     /// 本地提示（slash 反馈、启动信息等）
@@ -92,6 +93,9 @@ const SETTINGS_FIELDS: &[(&str, bool)] = &[
     ("model", true),
     ("start", false),
 ];
+
+/// 取消标记：agent 取消时遗留进行中块的结果文本（渲染层据此显红色"已取消"）
+const CANCEL_MARK: &str = "（已取消）";
 
 /// TUI 全部可变状态（单所有者，单线程 runtime 下无需锁）
 struct Ui {
@@ -116,8 +120,10 @@ struct Ui {
     set_sel: usize,
     /// 设置页：编辑态缓冲（None = 非编辑态）
     set_editing: Option<String>,
-    /// 设置页：进入时载入的各字段当前值（key 存真值，显示时才掩码）
+    /// 设置页：进入时载入的各字段**生效值**（合并视图；key 存真值，显示时才掩码）
     set_values: Vec<String>,
+    /// 设置页：各字段来源层标注（"工作区"/"全局"/"默认"/""）
+    set_sources: Vec<&'static str>,
     /// 待审批的命令提案队列（AI addcmd 提案或人类 /addcmd 自助注册，内存态不落盘）
     pending: Vec<ApprovedCommand>,
     /// 审批页：列表选中下标、desc 编辑态标志与编辑前备份（Esc 放弃时还原）
@@ -127,6 +133,8 @@ struct Ui {
     /// 删除页：进入时载入的已批准命令列表与选中下标
     del_list: Vec<ApprovedCommand>,
     del_sel: usize,
+    /// Tick 心跳计数（100ms 一次）：驱动工具调用 doing 动画帧
+    tick_count: u64,
 }
 
 /// RAII 守卫：构造时进 alternate screen + raw mode，Drop 时恢复。
@@ -161,10 +169,20 @@ pub async fn run(root: &Path) -> io::Result<()> {
     // 键盘事件转发线程：crossterm 的 read 是阻塞调用，
     // 放到专用 std 线程里，通过 tokio channel 送事件——
     // ≈ C# 里用 Channel 把同步 IO 桥接进 async 世界。
-    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    // poll(100ms) 超时即发 Tick：主循环借此做定时逻辑（splash 自动跳过），
+    // 这是 TUI 的经典心跳模式，比在 select! 里挂定时器分支行为更确定。
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
     std::thread::spawn(move || {
-        // while let：通道关闭或读失败时线程自然结束
-        while let Ok(ev) = crossterm::event::read() {
+        loop {
+            let ev = if crossterm::event::poll(std::time::Duration::from_millis(100)).unwrap_or(false)
+            {
+                match crossterm::event::read() {
+                    Ok(e) => TermEvent::Key(e),
+                    Err(_) => break,
+                }
+            } else {
+                TermEvent::Tick
+            };
             if key_tx.send(ev).is_err() {
                 break; // 主循环已退出
             }
@@ -187,12 +205,14 @@ pub async fn run(root: &Path) -> io::Result<()> {
         set_sel: 0,
         set_editing: None,
         set_values: Vec::new(),
+        set_sources: Vec::new(),
         pending: Vec::new(),
         appr_sel: 0,
         appr_editing: false,
         appr_desc_backup: String::new(),
         del_list: Vec::new(),
         del_sel: 0,
+        tick_count: 0,
     };
     // 启动信息（splash 下面的对话流里保留这几行供回看）
     ui.items.push(Item::Info(format!("工作区: {}", ui.workspace)));
@@ -209,29 +229,47 @@ pub async fn run(root: &Path) -> io::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
 
-    // splash 自动跳过时刻：约 1.2 秒
-    let splash_until = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
-
     while !ui.quit {
         draw(&mut term, &ui)?;
         // select! ≈ C# 的 Task.WhenAny：哪个事件先到处理哪个
         tokio::select! {
             ev = key_rx.recv() => {
                 let Some(ev) = ev else { break };
-                handle_key(&mut ui, ev, &mut agent, root);
+                match ev {
+                    TermEvent::Key(e) => handle_key(&mut ui, e, &mut agent, root),
+                    TermEvent::Tick => tick(&mut ui),
+                }
             }
             ev = agent.next() => {
                 let Some(ev) = ev else { break };
                 handle_agent(&mut ui, ev);
             }
-            // `if` 条件分支：只在 splash 期间启用定时器
-            // ≈ C# 里 Task.WhenAny(keys, Task.Delay(1200)) 的条件版
-            _ = tokio::time::sleep_until(splash_until), if ui.mode == Mode::Splash => {
-                ui.mode = Mode::Chat;
-            }
         }
     }
     Ok(())
+}
+
+/// 终端事件：真实按键 / 心跳（100ms 一次，驱动 doing 动画帧）
+enum TermEvent {
+    Key(Event),
+    Tick,
+}
+
+/// 心跳处理：只推进动画帧计数。
+/// splash 不自动跳过（拍板：停留到按任意键）——tick 到达不改模式。
+/// 抽成独立函数保持可测（帧推进是纯状态判断）。
+fn tick(ui: &mut Ui) {
+    ui.tick_count = ui.tick_count.wrapping_add(1);
+}
+
+/// doing 动画帧：每 5 个 tick（≈500ms）换一个点号数量，1→2→3 循环。
+/// 纯函数 ≈ C# 的 static 方法：同样输入恒定输出，单测直接断言。
+fn ellipsis_frame(tick_count: u64) -> &'static str {
+    match (tick_count / 5) % 3 {
+        0 => "doing.",
+        1 => "doing..",
+        _ => "doing...",
+    }
 }
 
 /// 键盘事件总入口：先按模式分流，各模式自己的处理器再细分按键
@@ -294,215 +332,6 @@ fn chat_key(ui: &mut Ui, code: KeyCode, modifiers: KeyModifiers, agent: &mut Age
 }
 
 /// Settings 模式的按键：选择 / 编辑 / 退出
-fn settings_key(ui: &mut Ui, code: KeyCode, root: &Path) {
-    // 编辑态：Enter 保存、Esc 放弃、字符进缓冲
-    if ui.set_editing.is_some() {
-        match code {
-            KeyCode::Enter => {
-                let value = ui.set_editing.take().unwrap_or_default();
-                settings_save(ui, root, value);
-            }
-            KeyCode::Esc => ui.set_editing = None,
-            KeyCode::Char(c) => {
-                if let Some(buf) = &mut ui.set_editing {
-                    buf.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(buf) = &mut ui.set_editing {
-                    buf.pop();
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-    // 选择态
-    match code {
-        KeyCode::Up => ui.set_sel = ui.set_sel.saturating_sub(1),
-        KeyCode::Down => ui.set_sel = (ui.set_sel + 1).min(SETTINGS_FIELDS.len() - 1),
-        // 进入编辑态：缓冲预填当前真值（key 给的是未掩码的真值）
-        KeyCode::Enter => ui.set_editing = Some(ui.set_values[ui.set_sel].clone()),
-        KeyCode::Esc => ui.mode = Mode::Chat,
-        _ => {}
-    }
-}
-
-/// Approve 模式的按键：模态编辑器的状态机——
-/// ≈ C# 里用 enum State { View, EditDesc } + switch 的手写状态机：
-/// 同一个 Enter/Esc 在不同状态下含义不同（View：批准/拒绝/退出；EditDesc：保存/放弃）。
-/// name 不可编辑（要改名 = 拒绝后用 /addcmd 重新注册），
-/// command 不可改（审批的字符串 = 永远执行的全部内容，安全红线）。
-fn approve_key(ui: &mut Ui, code: KeyCode, agent: &mut AgentHandle, root: &Path) {
-    // EditDesc 状态：字符直接改进选中条的 description，Enter 保存、Esc 还原备份
-    if ui.appr_editing {
-        match code {
-            KeyCode::Enter => ui.appr_editing = false, // 保存：改动已就地生效
-            KeyCode::Esc => {
-                let backup = std::mem::take(&mut ui.appr_desc_backup);
-                if let Some(p) = ui.pending.get_mut(ui.appr_sel) {
-                    p.description = backup;
-                }
-                ui.appr_editing = false;
-            }
-            KeyCode::Char(c) => {
-                if let Some(p) = ui.pending.get_mut(ui.appr_sel) {
-                    p.description.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(p) = ui.pending.get_mut(ui.appr_sel) {
-                    p.description.pop();
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-    // View 状态：列表导航 + 单条操作
-    match code {
-        KeyCode::Up => ui.appr_sel = ui.appr_sel.saturating_sub(1),
-        KeyCode::Down => {
-            if !ui.pending.is_empty() {
-                ui.appr_sel = (ui.appr_sel + 1).min(ui.pending.len() - 1);
-            }
-        }
-        KeyCode::Enter => approve_current(ui, agent, root),
-        // x / d 拒绝选中条
-        KeyCode::Char('x') | KeyCode::Char('d') => reject_current(ui),
-        KeyCode::Char('e') => {
-            // 进入描述编辑态：备份现值供 Esc 还原
-            if let Some(p) = ui.pending.get(ui.appr_sel) {
-                ui.appr_desc_backup = p.description.clone();
-                ui.appr_editing = true;
-            }
-        }
-        // Esc 退出页面：剩余提案保留在队列，下次 /allowcmd 继续
-        KeyCode::Esc => ui.mode = Mode::Chat,
-        _ => {}
-    }
-}
-
-/// 批准选中提案：command 原样（含就地编辑过的 desc）写入 .do/commands.json
-fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
-    let Some(p) = ui.pending.get(ui.appr_sel).cloned() else {
-        ui.mode = Mode::Chat;
-        return;
-    };
-    let name = p.name.trim().to_string();
-    // 批准前再验一次 name（AI 提案在 check_call 已验，这里双保险）
-    if !agent_core::commands::valid_name(&name) {
-        ui.items.push(Item::Info("name 只能包含字母/数字/_/-".into()));
-        return;
-    }
-    // 与内建工具或已批准命令重名 = 拒绝（覆盖已有工具太危险）。
-    // start 是隐式保留名（白名单视图会合并 config.start），一并保护
-    const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "addcmd", "runcmd", "start"];
-    let mut cmds = agent_core::commands::load(root);
-    if BUILTIN.contains(&name.as_str()) || cmds.iter().any(|c| c.name == name) {
-        ui.items.push(Item::Info(format!("name 冲突：{name} 已被占用")));
-        return;
-    }
-    cmds.push(p);
-    match agent_core::commands::save(root, &cmds) {
-        Ok(()) => {
-            ui.items.push(Item::Info(format!("已批准并注册: {name}")));
-            ui.pending.remove(ui.appr_sel);
-            // 批准后通知模型：以 user 角色注入历史（不触发 API）。
-            // tools 数组是冻结的，批准不改变 prompt 前缀——零缓存代价
-            if ui.has_key {
-                agent.send(Cmd::Notify(format!(
-                    "（系统提示：命令 {name} 已获批准，可用 runcmd 调用）"
-                )));
-            }
-            after_proposal_removed(ui);
-        }
-        Err(e) => ui.items.push(Item::Info(e.to_string())),
-    }
-}
-
-/// 拒绝选中提案：丢弃，不入盘
-fn reject_current(ui: &mut Ui) {
-    if let Some(p) = ui.pending.get(ui.appr_sel) {
-        ui.items.push(Item::Info(format!("已拒绝提案: {}", p.name)));
-        ui.pending.remove(ui.appr_sel);
-    }
-    after_proposal_removed(ui);
-}
-
-/// 移除一条后的收尾：留在页面并自动选中下一条；批空自动退出回对话
-fn after_proposal_removed(ui: &mut Ui) {
-    ui.appr_editing = false;
-    if ui.pending.is_empty() {
-        ui.mode = Mode::Chat;
-    } else {
-        ui.appr_sel = ui.appr_sel.min(ui.pending.len() - 1);
-    }
-}
-
-/// Delete 模式的按键：↑↓ 选择、Enter 删除、Esc 返回
-fn delete_key(ui: &mut Ui, code: KeyCode, root: &Path) {
-    match code {
-        KeyCode::Up => ui.del_sel = ui.del_sel.saturating_sub(1),
-        KeyCode::Down => {
-            if !ui.del_list.is_empty() {
-                ui.del_sel = (ui.del_sel + 1).min(ui.del_list.len() - 1);
-            }
-        }
-        KeyCode::Enter => {
-            if ui.del_sel < ui.del_list.len() {
-                let gone = ui.del_list.remove(ui.del_sel);
-                match agent_core::commands::save(root, &ui.del_list) {
-                    Ok(()) => ui.items.push(Item::Info(format!("已撤销: {}", gone.name))),
-                    Err(e) => ui.items.push(Item::Info(e.to_string())),
-                }
-                ui.del_sel = ui.del_sel.min(ui.del_list.len().saturating_sub(1));
-                if ui.del_list.is_empty() {
-                    ui.mode = Mode::Chat;
-                }
-            }
-        }
-        KeyCode::Esc => ui.mode = Mode::Chat,
-        _ => {}
-    }
-}
-
-/// 设置页保存一个字段：写哪层只读写哪层（与 /setting 命令同一纪律）
-fn settings_save(ui: &mut Ui, root: &Path, value: String) {    let (field, global) = SETTINGS_FIELDS[ui.set_sel];
-    let result = if global {
-        match agent_core::config::exe_dir() {
-            Some(dir) => {
-                let mut cfg = Config::load_global(&dir);
-                cfg.set(field, &value)
-                    .and_then(|()| cfg.save_global(&dir).map_err(|e| e.to_string()))
-            }
-            None => Err("无法定位 do.exe 目录，全局配置层不可用".to_string()),
-        }
-    } else {
-        let mut cfg = Config::load_workspace(root);
-        cfg.set(field, &value)
-            .and_then(|()| cfg.save(root).map_err(|e| e.to_string()))
-    };
-    match result {
-        Ok(()) => {
-            ui.set_values[ui.set_sel] = value.clone();
-            // 两层都影响状态栏，保存后刷新
-            if field == "model" {
-                ui.model = if value.is_empty() { "未设置".into() } else { value.clone() };
-            }
-            if field == "key" {
-                ui.has_key = !value.is_empty();
-            }
-            ui.items.push(Item::Info(format!(
-                "已更新{} {field}",
-                if global { " 全局" } else { "" }
-            )));
-        }
-        Err(e) => ui.items.push(Item::Info(e)),
-    }
-}
-
-/// agent 事件处理：流式增量拼到对话流最后一条同类记录上
 fn handle_agent(ui: &mut Ui, ev: Evt) {
     match ev {
         Evt::Proposal(p) => {
@@ -530,17 +359,47 @@ fn handle_agent(ui: &mut Ui, ev: Evt) {
             Some(Item::Reasoning { text, .. }) => text.push_str(&r),
             _ => ui.items.push(Item::Reasoning { text: r, open: true }),
         },
+        Evt::ToolStart { name, args } => {
+            // 派发即插入进行中块：用户立刻看到工具名，不用等执行结束
+            ui.items.push(Item::Tool { name, args, result: None });
+        }
         Evt::Tool { name, args, result } => {
-            ui.items.push(Item::Tool { name, args, result });
+            // 更新最后一个未完成块（多工具顺序执行时按序匹配）；
+            // 找不到（如取消前未发 ToolStart 的）则补一个完成态块。
+            // name/args 也要覆盖：提前宣告时 args 是空串，完成后补上真实参数
+            let idx = ui
+                .items
+                .iter()
+                .rposition(|i| matches!(i, Item::Tool { result: None, .. }));
+            match idx {
+                Some(i) => {
+                    if let Item::Tool { name: n, args: a, result: r, .. } = &mut ui.items[i] {
+                        *n = name;
+                        *a = args;
+                        *r = Some(result);
+                    }
+                }
+                None => ui.items.push(Item::Tool {
+                    name,
+                    args,
+                    result: Some(result),
+                }),
+            }
         }
         Evt::Error(e) => ui.items.push(Item::Error(e)),
         Evt::Tokens(n) => ui.tokens = n,
         Evt::Done => {
             ui.busy = false;
             if ui.cancel_pending {
-                // 取消的收尾：半截内容已保留，补一行说明
+                // 取消的收尾：半截内容已保留，补一行说明；
+                // 遗留的进行中工具块标"已取消"，不永远挂 doing 动画
                 ui.cancel_pending = false;
-                ui.items.push(Item::Info("（已取消）".into()));
+                for item in &mut ui.items {
+                    if let Item::Tool { result: r @ None, .. } = item {
+                        *r = Some(CANCEL_MARK.to_string());
+                    }
+                }
+                ui.items.push(Item::Info(CANCEL_MARK.into()));
             }
         }
     }
@@ -708,47 +567,10 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
     }
 }
 
-/// 进入设置页：载入两层当前值
-fn enter_settings(ui: &mut Ui, root: &Path) {
-    let global = agent_core::config::exe_dir().map(|d| Config::load_global(&d));
-    let ws = Config::load_workspace(root);
-    ui.set_values = SETTINGS_FIELDS
-        .iter()
-        .map(|(field, is_global)| {
-            let cfg = if *is_global { global.as_ref() } else { Some(&ws) };
-            cfg.map(|c| cfg_field(c, field)).unwrap_or_default()
-        })
-        .collect();
-    ui.set_sel = 0;
-    ui.set_editing = None;
-    ui.mode = Mode::Settings;
-}
-
-/// 按字段名取配置值（设置页载入用）
-fn cfg_field(cfg: &Config, field: &str) -> String {
-    match field {
-        "url" => cfg.url.clone(),
-        "key" => cfg.key.clone(),
-        "model" => cfg.model.clone(),
-        "start" => cfg.start.clone(),
-        _ => String::new(),
-    }
-}
-
-/// key 掩码：保留前 3 后 4 位（如 sk-****xxxx）；太短的整串打码
-fn mask_key(key: &str) -> String {
-    let n = key.chars().count();
-    if n > 7 {
-        let head: String = key.chars().take(3).collect();
-        let tail: String = key.chars().skip(n - 4).collect();
-        format!("{head}****{tail}")
-    } else {
-        "****".to_string()
-    }
-}
-
-/// slash 命令候选表：命令名 + 用法提示（渲染在状态栏上方的提示行）
-/// 数组 + 切片 ≈ C# 的静态只读表；零分配、零组件，够用就好。
+/// 进入设置页：载入各字段的**生效值**（合并视图）与来源层。
+/// 修复历史 bug：旧版按"字段归属层"各读单层——若值写在工作区层
+/// （如 `/setting key` 不带 -g），全局字段行就会错误地显示"未设置"。
+/// 显示用合并值；保存纪律不变（写哪层只写哪层，见 settings_save）。
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/setting", "/setting [-g] <url|key|model|start> <值>"),
     ("/new", "/new"),
@@ -934,148 +756,6 @@ fn draw(term: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &Ui) -> io::Resul
 }
 
 /// 启动画面：logo 居中 + 版本号 + 配置状态 + 跳过提示
-fn draw_splash(frame: &mut Frame, area: Rect, ui: &Ui) {
-    let mut lines: Vec<Line> = LOGO
-        .lines()
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Cyan))))
-        .collect();
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!("DoAgent v{}", env!("CARGO_PKG_VERSION"))));
-    lines.push(Line::from(format!("工作区: {}", ui.workspace)));
-    lines.push(Line::from(if ui.has_key {
-        "key 已设置".to_string()
-    } else {
-        "key 未设置：/setting -g key <你的key>".to_string()
-    }));
-    lines.push(Line::from(format!("model: {}", ui.model)));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "按任意键继续",
-        Style::default().fg(Color::DarkGray),
-    )));
-    // 垂直居中：上缘下移 (高度-内容)/2；水平居中交给 Alignment::Center
-    let content_h = lines.len() as u16;
-    let top = area.height.saturating_sub(content_h) / 2;
-    let centered = Rect {
-        y: area.y + top,
-        height: content_h.min(area.height),
-        ..area // 结构体更新语法：其余字段（x/width）沿用 area
-    };
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), centered);
-}
-
-/// 设置页内容：全局区 + 工作区，选中行青色高亮
-fn settings_lines(ui: &Ui) -> Vec<Line<'static>> {
-    let section = Style::default().fg(Color::DarkGray);
-    let mut out = vec![
-        Line::from(""),
-        Line::from(Span::styled("全局（exe 旁 do.config.json）", section)),
-    ];
-    for (i, (field, _)) in SETTINGS_FIELDS.iter().enumerate() {
-        if i == 3 {
-            out.push(Line::from(""));
-            out.push(Line::from(Span::styled("工作区（.do/config.json）", section)));
-        }
-        // key 显示掩码；空值显示占位
-        let shown = if *field == "key" {
-            mask_key(&ui.set_values[i])
-        } else {
-            ui.set_values[i].clone()
-        };
-        let shown = if shown.is_empty() { "（未设置）".to_string() } else { shown };
-        let selected = i == ui.set_sel;
-        let style = if selected {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        };
-        out.push(Line::from(Span::styled(
-            format!("{} {field:<6} = {shown}", if selected { ">" } else { " " }),
-            style,
-        )));
-    }
-    out
-}
-
-/// 审批页列表视图：上部是待批提案列表（选中行青色 `>` 高亮，跟随设置页
-/// 的视觉语言），下部是选中条详情（command 黄色只读折行全文 + mode + 描述）。
-/// desc 编辑态时详情行变青提示正在编辑。
-fn approve_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let section = Style::default().fg(Color::DarkGray);
-    if ui.pending.is_empty() {
-        return out;
-    }
-    out.push(Line::from(""));
-    out.push(Line::from(Span::styled(
-        format!("命令提案审批（{} 条待批）", ui.pending.len()),
-        section,
-    )));
-    // 提案列表：name + 描述摘要
-    for (i, p) in ui.pending.iter().enumerate() {
-        let selected = i == ui.appr_sel;
-        let style = if selected {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        };
-        let desc = if p.description.is_empty() { "(无)" } else { &p.description };
-        out.push(Line::from(Span::styled(
-            format!("{} {:<12} {desc}", if selected { ">" } else { " " }, p.name),
-            style,
-        )));
-    }
-    // 选中条详情
-    if let Some(p) = ui.pending.get(ui.appr_sel) {
-        out.push(Line::from(""));
-        out.push(Line::from(Span::styled("命令:".to_string(), section)));
-        // command 可能很长，按宽度折行完整展示（只读，不可修改——
-        // 审批的字符串 = 永远执行的全部内容）
-        for l in wrap_text(&p.command, width.max(8)) {
-            out.push(Line::from(Span::styled(l, Style::default().fg(Color::Yellow))));
-        }
-        out.push(Line::from(Span::styled(format!("mode: {}", p.mode), section)));
-        let desc = if p.description.is_empty() { "(无)" } else { &p.description };
-        let desc_style = if ui.appr_editing {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        };
-        out.push(Line::from(Span::styled(format!("描述: {desc}"), desc_style)));
-    }
-    out
-}
-
-/// 删除页：已批准命令列表，选中行青色
-fn delete_lines(ui: &Ui) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    out.push(Line::from(""));
-    out.push(Line::from(Span::styled(
-        "已批准命令（Enter 删除即撤销该工具）",
-        Style::default().fg(Color::DarkGray),
-    )));
-    for (i, c) in ui.del_list.iter().enumerate() {
-        let selected = i == ui.del_sel;
-        let style = if selected {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        };
-        out.push(Line::from(Span::styled(
-            format!(
-                "{} {:<12} = `{}`（{}）",
-                if selected { ">" } else { " " },
-                c.name,
-                c.command,
-                c.mode
-            ),
-            style,
-        )));
-    }
-    out
-}
-
-/// 把对话流摊平成物理行（含折行），每行一个样式
 fn build_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let w = width.max(8);
@@ -1099,14 +779,28 @@ fn build_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
                 }
             }
             Item::Tool { name, args, result } => {
-                // 折叠态：函数调用样式，如 read("src/main.rs")
+                // 折叠态：函数调用样式（青色）+ 状态字（分色）：
+                // doing 黄（动画帧随 tick 推进）/ done 绿 / 已取消 红
                 let style = Style::default().fg(Color::Cyan);
-                push_styled(&mut out, &format_call(name, args), w, style);
+                let (word, word_style) = match result {
+                    None => (ellipsis_frame(ui.tick_count), Style::default().fg(Color::Yellow)),
+                    Some(r) if r == CANCEL_MARK => {
+                        (CANCEL_MARK, Style::default().fg(Color::Red))
+                    }
+                    Some(_) => ("done", Style::default().fg(Color::Green)),
+                };
+                let line = Line::from(vec![
+                    Span::styled(format_call(name, args), style),
+                    Span::styled(format!(" {word}"), word_style),
+                ]);
+                out.extend(wrap_spans(line, w));
                 if ui.expand_all {
                     // 展开态：完整 args（原始 JSON）+ 截断后的结果
                     let dim = style.add_modifier(Modifier::DIM);
                     push_styled(&mut out, &indent(args), w, dim);
-                    push_styled(&mut out, &indent(result), w, dim);
+                    if let Some(r) = result {
+                        push_styled(&mut out, &indent(r), w, dim);
+                    }
                 }
             }
             Item::Info(t) => push_styled(&mut out, t, w, Style::default().fg(Color::DarkGray)),
@@ -1179,36 +873,40 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+
+#[cfg(test)]
+fn test_ui() -> Ui {
+    // 测试夹具：最小可用的 Ui
+    Ui {
+        items: Vec::new(),
+        input: String::new(),
+        scroll: 0,
+        expand_all: false,
+        tokens: 0,
+        model: String::new(),
+        has_key: false,
+        workspace: String::new(),
+        quit: false,
+        mode: Mode::Chat,
+        busy: false,
+        cancel_pending: false,
+        set_sel: 0,
+        set_editing: None,
+        set_values: Vec::new(),
+        set_sources: Vec::new(),
+        pending: Vec::new(),
+        appr_sel: 0,
+        appr_editing: false,
+        appr_desc_backup: String::new(),
+        del_list: Vec::new(),
+        del_sel: 0,
+        tick_count: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 造一个最小可用的 Ui（测试夹具）
-    fn test_ui() -> Ui {
-        Ui {
-            items: Vec::new(),
-            input: String::new(),
-            scroll: 0,
-            expand_all: false,
-            tokens: 0,
-            model: String::new(),
-            has_key: false,
-            workspace: String::new(),
-            quit: false,
-            mode: Mode::Chat,
-            busy: false,
-            cancel_pending: false,
-            set_sel: 0,
-            set_editing: None,
-            set_values: Vec::new(),
-            pending: Vec::new(),
-            appr_sel: 0,
-            appr_editing: false,
-            appr_desc_backup: String::new(),
-            del_list: Vec::new(),
-            del_sel: 0,
-        }
-    }
 
     #[test]
     fn slash_hint_filters_by_prefix() {
@@ -1276,13 +974,6 @@ mod tests {
         assert_eq!(format_call("write", "{}"), "write()");
     }
 
-    #[test]
-    fn key_masking_keeps_head3_tail4() {
-        assert_eq!(mask_key("sk-abcdefghij"), "sk-****ghij");
-        assert_eq!(mask_key("short"), "****");
-        assert_eq!(mask_key(""), "****");
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn addcmd_allowcmd_slash_behaviour() {
         let dir = std::env::temp_dir().join(format!("doagent-tui-{}", std::process::id()));
@@ -1308,117 +999,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn addcmd_self_register_and_desc_editing() {
-        let dir = std::env::temp_dir().join(format!("doagent-tui2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut agent = AgentHandle::start(&dir).unwrap();
+    #[test]
+    fn tool_start_then_result_updates_same_block() {
         let mut ui = test_ui();
-        // 自助注册：提案入队（desc 空、mode 默认 once）并直接开审批页选中它
-        slash(&mut ui, &mut agent, &dir, "addcmd deploy cargo build --release");
-        assert_eq!(ui.pending.len(), 1);
-        assert_eq!(ui.pending[0].name, "deploy");
-        assert_eq!(ui.pending[0].command, "cargo build --release"); // 含空格的整行剩余
-        assert_eq!(ui.pending[0].mode, "once");
-        assert!(ui.pending[0].description.is_empty());
-        assert_eq!(ui.mode, Mode::Approve);
-        assert_eq!(ui.appr_sel, 0);
-        // 非法 name：对话流报错且不入队
-        slash(&mut ui, &mut agent, &dir, "addcmd bad;name echo x");
-        assert_eq!(ui.pending.len(), 1);
-        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("字母/数字")));
-        // 描述编辑态：e 进入 → 敲字 → Enter 保存（就地改进选中条）
-        approve_key(&mut ui, KeyCode::Char('e'), &mut agent, &dir);
-        assert!(ui.appr_editing);
-        for c in "部署".chars() {
-            approve_key(&mut ui, KeyCode::Char(c), &mut agent, &dir);
-        }
-        approve_key(&mut ui, KeyCode::Enter, &mut agent, &dir);
-        assert!(!ui.appr_editing);
-        assert_eq!(ui.pending[0].description, "部署");
-        // 再进编辑态 → 敲字 → Esc 放弃并还原，仍在审批页
-        approve_key(&mut ui, KeyCode::Char('e'), &mut agent, &dir);
-        approve_key(&mut ui, KeyCode::Char('x'), &mut agent, &dir);
-        approve_key(&mut ui, KeyCode::Esc, &mut agent, &dir);
-        assert!(!ui.appr_editing);
-        assert_eq!(ui.pending[0].description, "部署");
-        assert_eq!(ui.mode, Mode::Approve);
-        let _ = std::fs::remove_dir_all(&dir);
+        // ToolStart 插入进行中块
+        handle_agent(&mut ui, Evt::ToolStart { name: "read".into(), args: "{\"path\":\"a.rs\"}".into() });
+        assert!(matches!(ui.items.last(), Some(Item::Tool { result: None, .. })));
+        // Tool 结果到来 → 更新同一块而不是新增
+        handle_agent(&mut ui, Evt::Tool { name: "read".into(), args: "{}".into(), result: "ok".into() });
+        assert_eq!(ui.items.iter().filter(|i| matches!(i, Item::Tool { .. })).count(), 1);
+        assert!(matches!(ui.items.last(), Some(Item::Tool { result: Some(r), .. }) if r == "ok"));
+        // 再来一对：顺序匹配更新
+        handle_agent(&mut ui, Evt::ToolStart { name: "ls".into(), args: "{}".into() });
+        handle_agent(&mut ui, Evt::Tool { name: "ls".into(), args: "{}".into(), result: "ls-ok".into() });
+        assert_eq!(ui.items.len(), 2);
+        // 取消收尾：遗留进行中块标"已取消"
+        handle_agent(&mut ui, Evt::ToolStart { name: "grep".into(), args: "{}".into() });
+        ui.busy = true;
+        ui.cancel_pending = true;
+        handle_agent(&mut ui, Evt::Done);
+        assert!(matches!(&ui.items[2], Item::Tool { result: Some(r), .. } if r == "（已取消）"));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn allowcmd_list_view_flow() {
-        let dir = std::env::temp_dir().join(format!("doagent-tui3-{}", std::process::id()));
+    async fn splash_stays_until_keypress() {
+        let dir = std::env::temp_dir().join(format!("doagent-splash-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut agent = AgentHandle::start(&dir).unwrap();
         let mut ui = test_ui();
-        // 两条待批提案
-        for (n, d) in [("aaa", "命令甲"), ("bbb", "命令乙")] {
-            ui.pending.push(ApprovedCommand {
-                name: n.into(),
-                command: format!("echo {n}"),
-                description: d.into(),
-                mode: "once".into(),
-            });
+        ui.mode = Mode::Splash;
+        // tick 到达不迁移模式（只推进动画帧）
+        for _ in 0..20 {
+            tick(&mut ui);
         }
-        slash(&mut ui, &mut agent, &dir, "allowcmd");
-        assert_eq!(ui.mode, Mode::Approve);
-        // 列表视图：两条都可见
-        let text: String = approve_lines(&ui, 80)
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect();
-        assert!(text.contains("aaa") && text.contains("bbb"), "{text}");
-        assert!(text.contains("2 条待批"), "{text}");
-        // ↓ 移动选中，详情区切到选中条
-        approve_key(&mut ui, KeyCode::Down, &mut agent, &dir);
-        assert_eq!(ui.appr_sel, 1);
-        let text: String = approve_lines(&ui, 80)
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect();
-        assert!(text.contains("echo bbb"), "{text}"); // 详情显示选中条命令全文
-        // Enter 批准选中条：落盘、列表缩减、自动选中下一条、留在页面
-        approve_key(&mut ui, KeyCode::Enter, &mut agent, &dir);
-        assert_eq!(ui.pending.len(), 1);
-        assert_eq!(ui.pending[0].name, "aaa");
-        assert_eq!(ui.appr_sel, 0);
-        assert_eq!(ui.mode, Mode::Approve);
-        let saved = agent_core::commands::load(&dir);
-        assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].name, "bbb");
-        // x 拒绝剩余条：批空自动退出回对话
-        approve_key(&mut ui, KeyCode::Char('x'), &mut agent, &dir);
-        assert!(ui.pending.is_empty());
+        assert_eq!(ui.mode, Mode::Splash);
+        assert_eq!(ui.tick_count, 20);
+        // 任意键（Press）进入对话
+        handle_key(
+            &mut ui,
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            &mut agent,
+            &dir,
+        );
         assert_eq!(ui.mode, Mode::Chat);
-        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("已拒绝")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn allowcmd_esc_keeps_queue() {
-        let dir = std::env::temp_dir().join(format!("doagent-tui4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut agent = AgentHandle::start(&dir).unwrap();
+    #[test]
+    fn ellipsis_frame_cycles() {
+        // 每 5 tick 换一帧：doing. → doing.. → doing... → 循环
+        assert_eq!(ellipsis_frame(0), "doing.");
+        assert_eq!(ellipsis_frame(4), "doing.");
+        assert_eq!(ellipsis_frame(5), "doing..");
+        assert_eq!(ellipsis_frame(10), "doing...");
+        assert_eq!(ellipsis_frame(15), "doing."); // 回绕
+    }
+
+    #[test]
+    fn tool_status_word_colors() {
+        // 三态分色：doing 黄 / done 绿 / 已取消 红；工具名保持青色
         let mut ui = test_ui();
-        ui.pending.push(ApprovedCommand {
-            name: "keep".into(),
-            command: "echo keep".into(),
-            description: String::new(),
-            mode: "once".into(),
-        });
-        slash(&mut ui, &mut agent, &dir, "allowcmd");
-        assert_eq!(ui.mode, Mode::Approve);
-        // Esc 退出页面，队列保留；下次 /allowcmd 继续
-        approve_key(&mut ui, KeyCode::Esc, &mut agent, &dir);
-        assert_eq!(ui.mode, Mode::Chat);
-        assert_eq!(ui.pending.len(), 1);
-        slash(&mut ui, &mut agent, &dir, "allowcmd");
-        assert_eq!(ui.mode, Mode::Approve);
-        let _ = std::fs::remove_dir_all(&dir);
+        ui.items.push(Item::Tool { name: "read".into(), args: "{\"path\":\"a.rs\"}".into(), result: None });
+        ui.items.push(Item::Tool { name: "ls".into(), args: "{}".into(), result: Some("x".into()) });
+        ui.items.push(Item::Tool { name: "grep".into(), args: "{}".into(), result: Some(CANCEL_MARK.into()) });
+        let lines = build_lines(&ui, 80);
+        // 每条工具块一行两 span：[青色函数调用, 分色状态字]
+        let status = |i: usize| (lines[i].spans[1].content.to_string(), lines[i].spans[1].style.fg);
+        assert_eq!(status(0), (" doing.".to_string(), Some(Color::Yellow)));
+        assert_eq!(status(1), (" done".to_string(), Some(Color::Green)));
+        assert_eq!(status(2), (" （已取消）".to_string(), Some(Color::Red)));
+        for line in &lines {
+            assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+        }
     }
 
     #[test]
