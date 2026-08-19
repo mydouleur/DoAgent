@@ -142,7 +142,11 @@ Linux / macOS:
 curl -fsSL https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.sh | sh
 ```
 
-Windows (PowerShell): `irm https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.ps1 | iex`
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/mydouleur/DoAgent/main/uninstall.ps1 | iex
+```
 
 Both delete the binary plus its sidecar files (config / whitelist / audit log) and, on Windows, remove the PATH entry. Nothing else exists — no registry, no services, no surprises in `%APPDATA%`.
 
