@@ -25,7 +25,14 @@ pub struct ToolDef {
     pub parameters: Value,
 }
 
-/// 全部 6 个工具的定义，随每次 API 请求发送。
+/// 7 个内建工具的名字（唯一名单，单一事实源）。
+/// `defs()`/`run()` 的 schema 与派发分支是手写 JSON/match，无法从本常量
+/// 直接生成——改动任何一处必须同步本表，测试 `defs_frozen_at_seven`
+/// 断言 defs() 的名字集合 == TOOL_NAMES；`run()` 的 match 也靠它对照。
+/// TUI（do crate）的重名检查同样引用本表，不再各自手写。
+pub const TOOL_NAMES: &[&str] = &["read", "write", "edit", "ls", "grep", "addcmd", "runcmd"];
+
+/// 全部 7 个工具的定义，随每次 API 请求发送。
 /// Vec ≈ C# 的 List<T>；json! 宏就地构造 JSON（≈ 匿名对象字面量）。
 pub fn defs() -> Vec<ToolDef> {
     vec![
@@ -129,9 +136,10 @@ pub async fn run(ws: &Workspace, name: &str, args: &Value) -> String {
         "ls" => tool_ls(ws, args),
         "grep" => tool_grep(ws, args),
         "runcmd" => tool_runcmd(ws, args).await,
-        // addcmd 正常由 agent 拦截（要发审批事件）；
-        // 走到这里说明漏拦，至少别把提案弄丢
-        "addcmd" => "已提交人类审批，结果待人工确认".to_string(),
+        // addcmd 正常由 agent 层拦截（要发审批事件、推 Proposal 给 TUI）；
+        // 走到这里说明漏拦，提案实际已丢——绝不能报成功文案让模型干等
+        // 不存在的审批，明确报错让它重试
+        "addcmd" => "addcmd 未被拦截（内部错误），请重试".to_string(),
         other => format!("未知工具: {other}"),
     }
 }
@@ -169,7 +177,12 @@ fn tool_read(ws: &Workspace, args: &Value) -> String {
         .take(limit)
         // enumerate 给每行配上行号，方便模型对准 edit 位置
         .enumerate()
-        .map(|(i, l)| format!("{}\t{l}", start + i))
+        .map(|(i, l)| {
+            // format! 参数统一内联捕获风格：先落变量再 {n} 引用，
+            // 不与位置参数/命名参数混用
+            let n = start + i;
+            format!("{n}\t{l}")
+        })
         .collect();
     let mut out = picked.join("\n");
     if start + picked.len() <= total {
@@ -207,6 +220,11 @@ fn tool_edit(ws: &Workspace, args: &Value) -> String {
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
     };
     let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    // 拒绝空 old：matches("") 命中 len+1 处（每个字符间隙都算），
+    // 配合 all=true 会把 new 插满全文——这不是替换，是毁坏文件
+    if old.is_empty() {
+        return "old 不能为空字符串".to_string();
+    }
     let real = match ws.resolve_read(path) {
         Ok(p) => p,
         Err(e) => return e.to_string(),
@@ -245,9 +263,12 @@ fn tool_ls(ws: &Workspace, args: &Value) -> String {
         Err(e) => return e.to_string(),
     };
     let mut names: Vec<String> = Vec::new();
+    let mut truncated = false;
     for entry in rd {
         if names.len() >= 200 {
-            names.push("... (已截断至 200 条)".to_string());
+            // 只记标志、这里不 push——截断行必须先记着，
+            // 等 sort 之后追加，否则排序会把它混进条目中间
+            truncated = true;
             break;
         }
         // `if let Ok(e) = ...`：只关心成功的分支，失败静默跳过
@@ -264,6 +285,10 @@ fn tool_ls(ws: &Workspace, args: &Value) -> String {
         }
     }
     names.sort();
+    // 截断标记永远在最后一条，不参与排序
+    if truncated {
+        names.push("... (已截断至 200 条)".to_string());
+    }
     names.join("\n")
 }
 
@@ -299,6 +324,13 @@ fn tool_grep(ws: &Workspace, args: &Value) -> String {
         if ws.is_hidden_path(p) {
             continue;
         }
+        // symlink 兜底：词法判断看不出指向 `.do` 的链接（read/ls 走
+        // workspace.resolve 有 realpath 一层，grep 自行遍历没有），
+        // 所以 canonicalize 后再判一次；解析失败（断链等）的条目跳过
+        let Ok(canon) = p.canonicalize() else { continue };
+        if ws.is_hidden_path(&canon) {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(p) else { continue };
         // strip_prefix 把绝对路径转回工作区相对路径，输出更短
         let rel = p.strip_prefix(root).unwrap_or(p);
@@ -330,7 +362,14 @@ async fn tool_runcmd(ws: &Workspace, args: &Value) -> String {
             }
             list.iter()
                 .map(|(c, src)| {
-                    format!("{} = `{}`（{}·{}）{}", c.name, c.command, c.mode, src, c.description)
+                    format!(
+                        "{} = `{}`（{}·{}）{}",
+                        c.name,
+                        c.command,
+                        c.mode,
+                        src.for_model(),
+                        c.description
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -350,9 +389,9 @@ async fn tool_runcmd(ws: &Workspace, args: &Value) -> String {
     }
 }
 
-/// 白名单合并视图 = 工作区层 + 全局层（重名工作区赢，带来源标注）。
+/// 白名单合并视图 = 工作区层 + 全局层（重名工作区赢，带来源层标注）。
 /// 全局层文件在 exe 旁、工作区之外，AI 物理不可达。
-fn whitelist(ws: &Workspace) -> Vec<(ApprovedCommand, &'static str)> {
+fn whitelist(ws: &Workspace) -> Vec<(ApprovedCommand, crate::commands::Layer)> {
     crate::commands::merged(ws.root(), crate::config::exe_dir().as_deref())
 }
 
@@ -376,16 +415,26 @@ async fn run_approved(ws: &Workspace, cmd: &ApprovedCommand) -> String {
     run_once(ws, &cmd.command).await
 }
 
-/// once 语义：执行固定命令串，等结束，返回输出尾部 20 KB。
-/// start 与批准的动态命令共用这一条执行路径。
+/// once 命令的执行超时：没有它，一个挂起的命令会让 output() 永远
+/// 等下去，整个 agent 循环被卡死（工具结果永远回不来）。
+/// 10 分钟是构建/测试类命令的经验上限，正常命令远用不到。
+const ONCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// once 语义：执行固定命令串，等结束（最长 ONCE_TIMEOUT），返回输出尾部 20 KB。
+/// 批准的 once 命令都走这同一条执行路径（daemon 在 run_approved 里提前分流）。
 async fn run_once(ws: &Workspace, cmd: &str) -> String {
-    let out = match shell_command(cmd)
+    // kill_on_drop(true)：超时时 timeout 会丢弃 output() 的 future，
+    // 连带丢弃内部的 Child——不设这个标志，被丢弃的子进程会在后台
+    // 继续跑成僵尸（tokio 默认 drop 不杀进程）。注：Windows 上
+    // cmd /c 被杀后其孙进程可能残留，属可接受的固有残余。
+    let out = shell_command(cmd)
         .current_dir(ws.root())
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => return e.to_string(),
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(ONCE_TIMEOUT, out).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return e.to_string(),
+        Err(_) => return "执行超时（10 分钟），进程已终止".to_string(),
     };
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -483,6 +532,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn grep_symlink_into_do_blocked() {
+        // 工作区内建 symlink 指向 .do 内文件：词法路径不含 .do，
+        // 必须靠 canonicalize 后的二次判断挡住，内容绝不能读出。
+        // （Windows 建符号链接需要权限，失败则跳过本测试）
+        let (ws, dir) = temp_ws("t8");
+        std::fs::write(dir.join(".do/config.json"), "needle secret").unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(
+            dir.join(".do/config.json"),
+            dir.join("link.txt"),
+        )
+        .is_ok();
+        #[cfg(not(windows))]
+        let linked =
+            std::os::unix::fs::symlink(dir.join(".do/config.json"), dir.join("link.txt")).is_ok();
+        if linked {
+            let out = run(&ws, "grep", &json!({"pattern": "needle"})).await;
+            assert!(!out.contains("secret"), "symlink 内容泄漏: {out}");
+            assert!(!out.contains("link.txt"), "{out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn addcmd_fallthrough_reports_internal_error() {
+        // addcmd 正常由 agent 层拦截；漏拦时必须报错而非假成功文案
+        let (ws, dir) = temp_ws("t9");
+        let out = run(
+            &ws,
+            "addcmd",
+            &json!({"name":"x","command":"y","description":"d","mode":"once"}),
+        )
+        .await;
+        assert!(out.contains("内部错误"), "{out}");
+        assert!(!out.contains("已提交"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn edit_uniqueness() {
         let (ws, dir) = temp_ws("t5");
         std::fs::write(dir.join("f.txt"), "aa bb aa").unwrap();
@@ -521,6 +609,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn ls_truncation_marker_stays_last() {
+        let (ws, dir) = temp_ws("t10");
+        // 造 205 个可见条目（文件名让排序后截断行若混进去必然错位）
+        for i in 0..205 {
+            std::fs::write(dir.join(format!("f{i:03}.txt")), "x").unwrap();
+        }
+        let out = run(&ws, "ls", &json!({})).await;
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 201, "200 条 + 1 截断行");
+        // 关键断言：截断标记必须在排序结果之后，即最后一行
+        assert_eq!(lines[200], "... (已截断至 200 条)");
+        // 且条目本身是排好序的
+        assert_eq!(lines[0], "f000.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn edit_rejects_empty_old() {
+        let (ws, dir) = temp_ws("t11");
+        std::fs::write(dir.join("f.txt"), "abc").unwrap();
+        // old="" 不防的话：matches("") 命中 len+1 处，配合 all=true
+        // 会把 new 插满每个字符间隙——必须直接拒绝，文件原样不动
+        let out = run(&ws, "edit", &json!({"path":"f.txt","old":"","new":"X","all":true})).await;
+        assert!(out.contains("不能为空"), "{out}");
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "abc");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn sample_cmds() -> Vec<ApprovedCommand> {
         vec![
             ApprovedCommand {
@@ -544,15 +661,14 @@ mod tests {
     #[test]
     fn defs_frozen_at_seven() {
         // tools 数组冻结：恰为 7 个固定内建工具，
-        // 白名单内容不进入 defs（缓存论点见 agent.rs）
+        // 白名单内容不进入 defs（缓存论点见 agent.rs）。
+        // defs() 是手写 JSON，TOOL_NAMES 是唯一名单——这里断言两者同步；
+        // run() 的 match 分支同样按 TOOL_NAMES 对照（注释见该常量）。
         // as_ref 借的是临时 Vec，先绑定再取（临时值生命周期 ≈ C# 里
         // 对方法返回值直接取引用会被编译器拦住——Rust 强制先落变量）
         let defs = defs();
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_ref()).collect();
-        assert_eq!(
-            names,
-            ["read", "write", "edit", "ls", "grep", "addcmd", "runcmd"]
-        );
+        assert_eq!(names, TOOL_NAMES);
     }
 
     #[tokio::test(flavor = "current_thread")]

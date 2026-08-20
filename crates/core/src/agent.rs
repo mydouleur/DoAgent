@@ -32,15 +32,24 @@ use tokio::sync::mpsc;
 // ToolCall 再导出，外部从 core::ToolCall 拿（经 lib.rs 二次再导出）
 pub use crate::api::ToolCall;
 
-/// system prompt：控制在 200 token 内（约 300 字内）。
-/// 一句话角色 + 工具纪律 + 维护 HANDOFF.md 的义务。
-pub const SYSTEM_PROMPT: &str = "你是 DoAgent，极简编程助手。用内建工具(read/write/edit/ls/grep)读写代码；已批准的固定命令用 runcmd 列出与执行，需要新命令用 addcmd 提案（人类批准后生效）；无自由 shell。改完代码用 runcmd 跑构建命令拿反馈。随时在工作区根维护 HANDOFF.md（当前目标/进展/关键决策/下一步），有进展就更新；新对话开始时若存在 HANDOFF.md 先用 read 读取续接。回答简洁，直接行动。";
+/// system prompt：控制在 200 token 内。
+/// 估算口径：CJK 按 cl100k 类分词器 ≈1 token/字、ASCII 按 chars/4 粗估——
+/// 本文 201 字符（118 CJK + 83 ASCII）≈ 140 token，明显低于上限。
+/// 内容 = 一句话角色 + 工具纪律 + 维护 HANDOFF.md 的义务。
+pub const SYSTEM_PROMPT: &str = "你是 DoAgent，极简编程助手。用内建工具(read/write/edit/ls/grep)读写代码，无自由 shell；批准的固定命令用 runcmd 列出与执行，新命令用 addcmd 提案（人类批准后生效）；改完代码用 runcmd 跑构建拿反馈。始终维护工作区根的 HANDOFF.md（目标/进展/决策/下一步），有进展即更新；新对话开始若它存在，先 read 续接。回答简洁，直接行动。";
+
+/// 单轮对话的工具往返上限（= 最大 API 调用次数），防模型陷入
+/// "调工具 → 再调工具"的死循环。16 是经验值，没有强理由：
+/// 足够完成正常的多步任务，失控时又能及时止损。
+/// 打满不是静默结束——见 chat_round 末尾的兜底注入。
+const MAX_TOOL_ROUNDS: usize = 16;
 
 /// TUI 发给 agent 的命令
 pub enum Cmd {
     /// 用户输入的一句话
     Chat(String),
-    /// /new：清空历史（第一条用户消息由 TUI 重新注入，通常是 HANDOFF.md）
+    /// /new：清空历史（不注入 HANDOFF.md——system prompt 已要求
+    /// AI 新对话开始时自行 read 续接，注入只是白费 token）
     Reset,
     /// Esc：中断当前轮。不走消息队列（actor 正忙时读不到队列），
     /// 而是直接置位共享的取消标志（见 AgentHandle.cancel）
@@ -185,21 +194,27 @@ async fn chat_round(
     cancel: &AtomicBool,
     audit: &mut crate::audit::Audit,
 ) {
-    // 工具往返设上限，防模型死循环
-    for _ in 0..16 {
-        // 生效配置 = 工作区层 > 全局便携层 > 默认；current_exe 失败自动降级
-        let cfg = Config::load_merged(ws.root(), crate::config::exe_dir().as_deref());
+    // HTTP client 一轮对话只建一次：内部是连接池 + TLS 会话缓存，
+    // 工具往返的多次 API 调用复用它（≈ C# 复用 HttpClient 的纪律）
+    let client = reqwest::Client::new();
+    // 生效配置同样一轮加载一次、整轮复用（原先在循环体内：单轮最多
+    // 16×2 次磁盘读取，且中途改配置会导致同一轮内前后请求的
+    // model/url 不一致）。语义：配置改动从下一轮对话开始生效。
+    let cfg = Config::load_merged(ws.root(), crate::config::exe_dir().as_deref());
+    // 区分循环的两种出口：break 是正常结束，走到底是打满上限
+    let mut exhausted = true;
+    for _ in 0..MAX_TOOL_ROUNDS {
         // 回调把流式增量就地转成事件推给 TUI。
         // announced 记录哪些 tool_call 已在流式中段宣告过（ToolBegin），
         // 供下方派发阶段判重——同一次调用不许出两个 doing 块
         let mut announced = std::collections::HashSet::new();
-        let reply = api::chat(&cfg, messages, defs, cancel, |d| {
+        let reply = api::chat(&client, &cfg, messages, defs, cancel, |d| {
             let _ = match d {
                 api::Delta::Text(t) => evt.send(Evt::Text(t)),
                 api::Delta::Reasoning(r) => evt.send(Evt::Reasoning(r)),
                 api::Delta::ToolBegin(idx, name) => {
                     announced.insert(idx);
-                    // args 还没拼完，先空串——TUI 显示 read() doing.
+                    // args 还没拼完，先空串——TUI 立即显示进行中状态块
                     evt.send(Evt::ToolStart { name, args: String::new() })
                 }
             };
@@ -219,12 +234,14 @@ async fn chat_round(
             if !reply.content.is_empty() {
                 messages.push(json!({"role": "assistant", "content": reply.content}));
             }
+            exhausted = false;
             break;
         }
 
         if reply.tool_calls.is_empty() {
             // 纯文本回复：assistant 消息入列，本轮结束
             messages.push(json!({"role": "assistant", "content": reply.content}));
+            exhausted = false;
             break;
         }
 
@@ -235,6 +252,15 @@ async fn chat_round(
             // 取消检查点②：每次工具执行前看标志。置位则不执行，
             // 但仍回填一条 tool 结果——协议要求每个 tool_call 都有应答
             if cancel.load(Ordering::Relaxed) {
+                // 协议对称：Tool 之前必有 ToolStart。取消路径若该调用
+                // 未在流式中段宣告过（ToolBegin），先补发 ToolStart，
+                // 否则 TUI 只能靠兜底补块
+                if !announced.contains(&call_idx) {
+                    let _ = evt.send(Evt::ToolStart {
+                        name: tc.name.clone(),
+                        args: tc.arguments.clone(),
+                    });
+                }
                 let _ = evt.send(Evt::Tool {
                     name: tc.name.clone(),
                     args: tc.arguments.clone(),
@@ -302,9 +328,23 @@ async fn chat_round(
         }
         // 工具循环期间被取消：结果已回填完毕，不再发起下一轮 API
         if cancel.load(Ordering::Relaxed) {
+            exhausted = false;
             break;
         }
         // 继续循环：把工具结果交给模型，等下一步指示
+    }
+    if exhausted {
+        // 工具往返打满：历史此刻以 tool 消息结尾，不说明的话模型不知道
+        // 被截断、用户也看不到原因。注入一条 user 说明（本轮不再发起
+        // API，该消息从下一轮对话起生效），并记一笔审计
+        messages.push(json!({
+            "role": "user",
+            "content": format!("（系统提示）工具往返已达上限 {MAX_TOOL_ROUNDS} 次，请基于现有工具结果直接作答，不要再调用工具"),
+        }));
+        audit.log(
+            "reply",
+            json!({ "truncated": "tool_rounds_limit", "max": MAX_TOOL_ROUNDS }),
+        );
     }
     let _ = evt.send(Evt::Done);
     let tokens = estimate_tokens(messages);
@@ -322,6 +362,8 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// 派发前校验：解析 arguments + 按各工具的必填/类型规则检查。
 /// 7 个内建工具的 schema 很简单，手写检查即可，不引 JSON Schema 库。
 /// 返回 Ok(解析后的参数) 或 Err(给模型看的错误文案)。
+/// ⚠ 互指注释：这里的参数校验规则与 tools.rs 的 schema（defs()）是两份
+/// 手写真相，改动任一处必须同步另一处；工具名单以 tools::TOOL_NAMES 为准。
 fn check_call(name: &str, raw_args: &str) -> Result<Value, String> {
     let args: Value = serde_json::from_str(raw_args)
         .map_err(|_| "参数校验失败：arguments 不是合法 JSON".to_string())?;

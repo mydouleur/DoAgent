@@ -63,10 +63,18 @@ impl Audit {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // 平铺一条记录：固定三字段 + payload 各字段
-        let mut rec = json!({ "ts": ts, "ws": self.ws, "kind": kind });
-        if let (Value::Object(r), Value::Object(p)) = (&mut rec, &payload) {
-            r.extend(p.clone());
+        // 平铺一条记录：先铺 payload 各字段，再写固定三字段——
+        // serde_json 的 Map 同键后写覆盖先写，这个顺序保证 payload
+        // 里即使夹带 ts/ws/kind 也覆盖不掉固定字段的真实值
+        let mut rec = match payload {
+            Value::Object(_) => payload,
+            // 非 object 的 payload 丢弃（与旧行为一致：只有固定字段）
+            _ => json!({}),
+        };
+        if let Value::Object(r) = &mut rec {
+            r.insert("ts".into(), json!(ts));
+            r.insert("ws".into(), json!(self.ws));
+            r.insert("kind".into(), json!(kind));
         }
         let _ = writeln!(f, "{rec}");
     }
@@ -106,6 +114,26 @@ mod tests {
         let tool: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(tool["name"], "read");
         assert_eq!(tool["duration_ms"], 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fixed_fields_cannot_be_overridden() {
+        // payload 夹带 ts/ws/kind 时不得覆盖固定字段的真实值
+        let dir = std::env::temp_dir().join(format!("doagent-audit2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let mut a = Audit::at(Some(path.clone()), Path::new("C:\\ws"));
+        a.log("tool", json!({"kind": "fake", "ws": "X:\\evil", "ts": 0, "name": "read"}));
+        drop(a);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["kind"], "tool");
+        assert_eq!(v["ws"], "C:\\ws");
+        assert!(v["ts"].as_u64().unwrap() > 0);
+        // payload 自有字段照常平铺
+        assert_eq!(v["name"], "read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -20,6 +20,15 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// SSE 空闲超时：两次 chunk 之间的最长静默时间。
+/// 为什么不用 Client 总超时：SSE 长生成（几千行代码）整体耗时可超数分钟，
+/// 总超时会误杀正常的长回复；真正要防的是"连接挂着但服务端再不发数据"
+/// 的挂死——那种情况下 Esc 取消标志（每 chunk 检查一次）也永远轮不到读。
+/// 所以只对单次 `stream.next()` 掐表，每收到一个 chunk 计时自动重置。
+/// 120s 取的是常见推理模型首 token 与长思考间隔的经验上限。
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 一次完整的模型回复（流结束后的累积结果）
 #[derive(Debug, Default)]
@@ -91,14 +100,17 @@ fn tools_json(defs: &[ToolDef]) -> Value {
 /// 每个增量到达时同步调用——借它把流实时转成 TUI 事件。
 /// `cancel` 是取消标志：每个 SSE chunk 处理前检查一次，
 /// 置位则带着半截累积结果提前返回（cancelled = true）。
+/// `client` 由调用方创建并复用：reqwest::Client 内部是连接池 +
+/// TLS 会话缓存（≈ C# 里应复用同一个 HttpClient 而不是每次 new），
+/// 工具往返的多次调用共享它，省去重复的 TCP/TLS 握手。
 pub async fn chat(
+    client: &reqwest::Client,
     cfg: &Config,
     messages: &[Value],
     defs: &[ToolDef],
     cancel: &AtomicBool,
     mut on_delta: impl FnMut(Delta),
 ) -> Result<Reply, String> {
-    let client = reqwest::Client::new();
     let body = serde_json::to_string(&json!({
         "model": cfg.model,
         "messages": messages,
@@ -117,7 +129,9 @@ pub async fn chat(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {status}: {body}"));
+        // 错误体截断到 2 KB：服务端出错时可能回一整页 HTML，
+        // 原样进错误信息会把对话流刷屏
+        return Err(format!("HTTP {status}: {}", head_chars(&body, 2048)));
     }
 
     // bytes_stream() 拿到字节流，Eventsource 包一层解 SSE 帧。
@@ -125,8 +139,27 @@ pub async fn chat(
     let mut stream = resp.bytes_stream().eventsource();
     let mut acc = Accumulator::default();
 
-    // `while let Some(x) = ... .await`：异步迭代 ≈ await foreach
-    while let Some(event) = stream.next().await {
+    // `loop` + 手动取下一帧，比 while let 多一步：给每次读取套上
+    // 空闲超时（理由见 SSE_IDLE_TIMEOUT 注释）。超时只是"这一帧等太久"，
+    // 不代表整轮失败——但 SSE 场景里长时间无 chunk 即为挂死，直接报错。
+    loop {
+        let next = match tokio::time::timeout(SSE_IDLE_TIMEOUT, stream.next()).await {
+            Ok(n) => n,
+            Err(_) => {
+                // 超时返回前先看取消标志：用户已按 Esc 就走取消路径
+                // （保留半截内容），而不是报超时错误
+                if cancel.load(Ordering::Relaxed) {
+                    acc.reply.cancelled = true;
+                    break;
+                }
+                return Err(format!(
+                    "响应超时：{} 秒内未收到任何数据",
+                    SSE_IDLE_TIMEOUT.as_secs()
+                ));
+            }
+        };
+        // None = 流正常结束
+        let Some(event) = next else { break };
         // 取消检查点①：每个 chunk 处理前看标志。Relaxed 足够——
         // 纯标志位，没有需要顺带同步的其他数据（≈ C# volatile 读）
         if cancel.load(Ordering::Relaxed) {
@@ -166,6 +199,19 @@ pub async fn chat(
     Ok(acc.reply)
 }
 
+/// 取字符串头部至多 n 个字节，回退到 char 边界切（不切坏 UTF-8）。
+/// 与 tools.rs 的尾部截断同理，只是方向相反：往回退边界即可。
+fn head_chars(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let mut i = n;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
 /// tool_calls 增量累加器：按 `index` 归堆，顺序拼接 arguments。
 /// 单独抽成结构体是为了可测试（碎片帧、交错 index 都是真实场景）。
 #[derive(Default)]
@@ -184,17 +230,21 @@ impl Accumulator {
             self.reply.tool_calls.push(ToolCall::default());
         }
         let slot = &mut self.reply.tool_calls[idx];
-        // id / name 只在首帧带全量，后续帧为空——非空才覆盖
+        // id / name：槽位为空才写入（幂等）。按协议它们只在首帧带全量，
+        // 但有些代理网关会在多帧里重复发全量——若无脑 push_str 追加，
+        // name 会拼成 "readread" 导致派发失败
         if let Some(id) = tc["id"].as_str() {
-            slot.id.push_str(id);
+            if slot.id.is_empty() {
+                slot.id.push_str(id);
+            }
         }
         let mut first_named = None;
         if let Some(name) = tc["function"]["name"].as_str() {
             // 槽位原本没名字 → 这是该调用的首次宣告
             if slot.name.is_empty() {
+                slot.name.push_str(name);
                 first_named = Some((idx, name.to_string()));
             }
-            slot.name.push_str(name);
         }
         // arguments 是真正的增量片段，无脑拼接
         if let Some(args) = tc["function"]["arguments"].as_str() {
@@ -221,6 +271,18 @@ mod tests {
     }
 
     #[test]
+    fn head_chars_respects_char_boundary() {
+        // ASCII 短串原样返回
+        assert_eq!(head_chars("abc", 2048), "abc");
+        // 超长截断
+        assert_eq!(head_chars(&"x".repeat(3000), 2048).len(), 2048);
+        // 中文（3 字节/字）：2048 落在字符中间时回退到边界，不切坏 UTF-8
+        let s = "汉".repeat(1000); // 3000 字节
+        let cut = head_chars(&s, 2048);
+        assert_eq!(cut.chars().count(), 682); // 682*3=2046 ≤ 2048
+    }
+
+    #[test]
     fn first_name_announced_exactly_once() {
         // name 只在首帧出现：第一次推入返回 Some，后续碎片帧返回 None
         let mut acc = Accumulator::default();
@@ -237,6 +299,25 @@ mod tests {
             &json!({"index":1,"id":"c2","function":{"name":"ls","arguments":"{}"}}),
         );
         assert_eq!(third, Some((1, "ls".to_string())));
+    }
+
+    #[test]
+    fn repeated_full_name_not_doubled() {
+        // 代理网关的怪癖：多帧重复发全量 id/name。
+        // 幂等写入保证不会拼成 "readread" / "c1c1"，也不重复宣告
+        let mut acc = Accumulator::default();
+        let first = acc.push_tool_call(
+            &json!({"index":0,"id":"c1","function":{"name":"read","arguments":"{\"pa"}}),
+        );
+        assert_eq!(first, Some((0, "read".to_string())));
+        let dup = acc.push_tool_call(
+            &json!({"index":0,"id":"c1","function":{"name":"read","arguments":"th\":\"a.rs\"}"}}),
+        );
+        assert_eq!(dup, None);
+        let reply = acc.reply;
+        assert_eq!(reply.tool_calls[0].id, "c1");
+        assert_eq!(reply.tool_calls[0].name, "read");
+        assert_eq!(reply.tool_calls[0].arguments, "{\"path\":\"a.rs\"}");
     }
 
     #[test]

@@ -117,7 +117,7 @@ impl Workspace {
 
         // 第 4 层：根内校验。注意 resolved 里 real 部分已是真实路径，
         // suffix 部分词法上无 `..`（第 1 层已折叠），前缀比较即可。
-        if !resolved.starts_with(&self.root) {
+        if !within_root(&resolved, &self.root) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "路径越出工作区",
@@ -134,6 +134,8 @@ impl Workspace {
             // 关键：与真实不存在逐字一致——直接对路径做 canonicalize，
             // 让操作系统自己产生那个 NotFound 错误（文案随系统语言，
             // 但这正是"真实不存在"时程序会看到的那个错误）。
+            // HiddenWrite 在此实际不可达：resolve_read 固定传 for_write=false，
+            // resolve 只会产出 Hidden；合并写法只因两种隐藏的读语义相同
             Access::Hidden | Access::HiddenWrite => Err(not_found()),
         }
     }
@@ -161,6 +163,24 @@ impl Workspace {
 /// 因此 kind 与文案天然逐字一致（都随系统语言走）。
 fn not_found() -> io::Error {
     io::Error::from_raw_os_error(2)
+}
+
+/// 第 4 层的根内比较：resolved 是否落在 root 之内。
+/// Windows 文件系统大小写不敏感，但 Path::starts_with 逐字节比较——
+/// 同一目录写成 `d:\doagent` 与 `D:\DoAgent` 会被误判越界，
+/// 所以 Windows 下两边统一小写再按组件比较（is_hidden_name 同款归一）。
+/// Unix 路径大小写敏感，逐字节比较才是正确语义，不能统一小写，
+/// 用 cfg 分支区分（编译期选择，另一分支被死代码消除）。
+fn within_root(resolved: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        Path::new(&resolved.to_string_lossy().to_lowercase())
+            .starts_with(Path::new(&root.to_string_lossy().to_lowercase()))
+    }
+    #[cfg(not(windows))]
+    {
+        resolved.starts_with(root)
+    }
 }
 
 /// 第 1 层：词法归一化。
@@ -271,6 +291,26 @@ mod tests {
         let p = ws.resolve_read("ok.txt").unwrap();
         assert!(p.ends_with("ok.txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_mismatch_still_in_root() {
+        // Windows：同一目录不同大小写不得误判"越出工作区"
+        assert!(within_root(
+            Path::new("d:\\doagent\\src\\main.rs"),
+            Path::new("D:\\DoAgent"),
+        ));
+        // 但真正的越界仍须拒绝（大小写归一不能放宽边界）
+        assert!(!within_root(
+            Path::new("d:\\other\\x.txt"),
+            Path::new("D:\\DoAgent"),
+        ));
+        // 前缀撞车也不能放行：doagent2 不是 doagent 的子路径
+        assert!(!within_root(
+            Path::new("D:\\DoAgent2\\x.txt"),
+            Path::new("d:\\doagent"),
+        ));
     }
 
     #[test]

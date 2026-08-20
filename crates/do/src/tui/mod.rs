@@ -56,7 +56,7 @@ use pages::{approve_lines, delete_lines, draw_splash, settings_lines};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
-    /// 启动画面：任意键或定时器自动跳过，不强制等待
+    /// 启动画面：停留到按任意键才进入对话（tick 心跳刻意不跳过）
     Splash,
     /// 对话主界面
     Chat,
@@ -70,7 +70,7 @@ enum Mode {
 
 /// 对话流里的一条记录
 enum Item {
-    /// 用户输入（含注入的 HANDOFF.md）
+    /// 用户输入（原样入流，不注入任何附加内容）
     User(String),
     /// 思考过程。流式期间 open=true 实时可见（等待时能看到进展）；
     /// 正文一开始输出就自动折叠为一行摘要
@@ -87,9 +87,10 @@ enum Item {
     Error(String),
 }
 
-/// 设置页字段表：字段名 + 是否全局层（false = 工作区层）
-/// 设置页字段表：字段名 + 是否全局层（当前三项全是全局身份项，
-/// 工作区 Section 为空则不显示）
+/// 设置页字段表：字段名 + 是否全局层（false = 工作区层）。
+/// 当前三项全是全局身份项（bool 恒 true，工作区 Section 为空则不显示）；
+/// bool 保留为结构占位：settings_save 的双层分支已就位，将来若要
+/// 加工作区级字段只需在表里补一行
 const SETTINGS_FIELDS: &[(&str, bool)] = &[
     ("url", true),
     ("key", true),
@@ -110,7 +111,7 @@ struct Ui {
     tokens: usize,
     model: String,
     has_key: bool,
-    /// 界面语言（/setting lang zh|en；默认 en）
+    /// 界面语言（/lang zh|en 切换；默认 en）
     lang: Lang,
     workspace: String,
     /// true 时退出主循环
@@ -134,9 +135,8 @@ struct Ui {
     appr_sel: usize,
     appr_editing: bool,
     appr_desc_backup: String,
-    /// 删除页：进入时载入的已批准命令列表与选中下标
-    /// 删除页：进入时载入的合并视图（命令 + 来源层标注）与选中下标
-    del_list: Vec<(ApprovedCommand, &'static str)>,
+    /// 删除页：进入时载入的合并视图（命令 + 来源层）与选中下标
+    del_list: Vec<(ApprovedCommand, agent_core::Layer)>,
     del_sel: usize,
     /// Tick 心跳计数（100ms 一次）：驱动工具调用 doing 动画帧
     tick_count: u64,
@@ -150,7 +150,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<TerminalGuard> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        // EnterAlternateScreen 失败时先手动关 raw mode 再返回——
+        // 此刻守卫尚未构造，Drop 不会兜底，直接 `?` 会把终端烂在 raw mode
+        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
         Ok(TerminalGuard)
     }
 }
@@ -174,7 +179,7 @@ pub async fn run(root: &Path) -> io::Result<()> {
     // 键盘事件转发线程：crossterm 的 read 是阻塞调用，
     // 放到专用 std 线程里，通过 tokio channel 送事件——
     // ≈ C# 里用 Channel 把同步 IO 桥接进 async 世界。
-    // poll(100ms) 超时即发 Tick：主循环借此做定时逻辑（splash 自动跳过），
+    // poll(100ms) 超时即发 Tick：主循环借此驱动工具状态字的 doing 动画帧，
     // 这是 TUI 的经典心跳模式，比在 select! 里挂定时器分支行为更确定。
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
     std::thread::spawn(move || {
@@ -241,20 +246,39 @@ pub async fn run(root: &Path) -> io::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
 
+    // dirty 标志：只在显示内容可能变化后才重渲染。
+    // 此前每个 100ms tick 都全量 build_lines（含全部 Assistant 文本的
+    // Markdown 重解析），idle 时每秒白跑 10 次；现在 tick 仅在
+    // "存在进行中工具块"（doing 点号动画要推进）时才置脏。
+    // 按键/agent 事件一律置脏（保守策略：个别无效按键多画一帧无感，
+    // 漏置脏导致画面不更新才是 bug）；resize 走按键通道同样被覆盖。
+    let mut dirty = true; // 首帧必画
     while !ui.quit {
-        draw(&mut term, &ui)?;
+        if dirty {
+            draw(&mut term, &ui)?;
+            dirty = false;
+        }
         // select! ≈ C# 的 Task.WhenAny：哪个事件先到处理哪个
         tokio::select! {
             ev = key_rx.recv() => {
                 let Some(ev) = ev else { break };
                 match ev {
-                    TermEvent::Key(e) => handle_key(&mut ui, e, &mut agent, root),
-                    TermEvent::Tick => tick(&mut ui),
+                    TermEvent::Key(e) => {
+                        handle_key(&mut ui, e, &mut agent, root);
+                        dirty = true;
+                    }
+                    TermEvent::Tick => {
+                        tick(&mut ui);
+                        if needs_anim_frame(&ui) {
+                            dirty = true;
+                        }
+                    }
                 }
             }
             ev = agent.next() => {
                 let Some(ev) = ev else { break };
                 handle_agent(&mut ui, ev);
+                dirty = true;
             }
         }
     }
@@ -274,14 +298,25 @@ fn tick(ui: &mut Ui) {
     ui.tick_count = ui.tick_count.wrapping_add(1);
 }
 
-/// doing 动画帧：每 5 个 tick（≈500ms）换一个点号数量，1→2→3 循环。
+/// tick 后是否需要重绘：只有"存在进行中工具块"（doing 点号动画依赖
+/// tick 驱动换帧）才需要；无变化时主循环跳过整帧重建（见 run 的 dirty 注释）。
+/// 抽成纯函数供单测直接断言。
+fn needs_anim_frame(ui: &Ui) -> bool {
+    ui.items
+        .iter()
+        .any(|i| matches!(i, Item::Tool { result: None, .. }))
+}
+
+/// 进行中状态字 + 点号动画帧：每 5 个 tick（≈500ms）换一个点号数量，
+/// 1→2→3 循环。状态字走 lang 表（i18n），点号是中性符号不翻译。
 /// 纯函数 ≈ C# 的 static 方法：同样输入恒定输出，单测直接断言。
-fn ellipsis_frame(tick_count: u64) -> &'static str {
-    match (tick_count / 5) % 3 {
-        0 => "doing.",
-        1 => "doing..",
-        _ => "doing...",
-    }
+fn ellipsis_frame(lang: Lang, tick_count: u64) -> String {
+    let dots = match (tick_count / 5) % 3 {
+        0 => ".",
+        1 => "..",
+        _ => "...",
+    };
+    format!("{}{dots}", lang.t(Key::Doing))
 }
 
 /// 键盘事件总入口：先按模式分流，各模式自己的处理器再细分按键
@@ -300,7 +335,7 @@ fn handle_key(ui: &mut Ui, ev: Event, agent: &mut AgentHandle, root: &Path) {
         return;
     }
     match ui.mode {
-        // splash：任意键跳过（定时器也会自动跳过）
+        // splash：任意键进入对话（tick 刻意不跳过，见 tick()）
         Mode::Splash => ui.mode = Mode::Chat,
         Mode::Settings => settings_key(ui, code, root),
         Mode::Approve => approve_key(ui, code, agent, root),
@@ -343,7 +378,8 @@ fn chat_key(ui: &mut Ui, code: KeyCode, modifiers: KeyModifiers, agent: &mut Age
     }
 }
 
-/// Settings 模式的按键：选择 / 编辑 / 退出
+/// agent 事件处理：流式增量拼到对话流最后一条同类记录上；
+/// 工具结果按 FIFO 回填第一个进行中块（详见 Tool 分支注释）
 fn handle_agent(ui: &mut Ui, ev: Evt) {
     match ev {
         Evt::Proposal(p) => {
@@ -379,13 +415,15 @@ fn handle_agent(ui: &mut Ui, ev: Evt) {
             ui.items.push(Item::Tool { name, args, result: None });
         }
         Evt::Tool { name, args, result } => {
-            // 更新最后一个未完成块（多工具顺序执行时按序匹配）；
+            // 更新第一个未完成块：agent 顺序执行工具，结果按派发顺序回来，
+            // FIFO 匹配（position）才不会在并行调用（连续多个 doing 块）
+            // 时把先完成的结果错填到最后一个块上（rposition 的串位 bug）；
             // 找不到（如取消前未发 ToolStart 的）则补一个完成态块。
             // name/args 也要覆盖：提前宣告时 args 是空串，完成后补上真实参数
             let idx = ui
                 .items
                 .iter()
-                .rposition(|i| matches!(i, Item::Tool { result: None, .. }));
+                .position(|i| matches!(i, Item::Tool { result: None, .. }));
             match idx {
                 Some(i) => {
                     if let Item::Tool { name: n, args: a, result: r, .. } = &mut ui.items[i] {
@@ -440,9 +478,9 @@ fn submit(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
     agent.send(Cmd::Chat(text));
 }
 
-/// slash 命令：/setting /new /quit
+/// slash 命令本地分发：/setting /new /addcmd /allowcmd /deletecmd /lang /quit
 fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
-    // splitn(2, ...)：命令名与参数一刀两断，参数里允许含空格（start 需要）
+    // splitn(2, ...)：命令名与参数一刀两断，参数里允许含空格（如 /addcmd 的命令全文）
     let mut parts = rest.trim().splitn(2, char::is_whitespace);
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
@@ -451,10 +489,14 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
         // /addcmd：仅人类自助注册（name 与命令全文必填）。
         // 注册后仍开审批页确认——保持"落盘前必有确认"的不变量
         "addcmd" => {
-            // `-g` 前缀注册到全局层（exe 旁 do.commands.json），与 /setting -g 同构
-            let (global, rest) = match arg.strip_prefix("-g") {
-                Some(r) => (true, r.trim()),
-                None => (false, arg),
+            // `-g` 前缀注册到全局层（exe 旁 do.commands.json），与 /setting -g 同构。
+            // `-g` 必须是独立词：按空白切分后判断首 token，
+            // `-gfoo` 不是开关，整体落入 name 校验
+            let mut head = arg.splitn(2, char::is_whitespace);
+            let (global, rest) = if head.next() == Some("-g") {
+                (true, head.next().unwrap_or("").trim())
+            } else {
+                (false, arg)
             };
             let mut kv = rest.splitn(2, char::is_whitespace);
             let name = kv.next().unwrap_or("");
@@ -493,7 +535,6 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                 ui.mode = Mode::Approve;
             }
         }
-        // /deletecmd：带名字直接删；不带则进入删除页
         // /deletecmd：带名字直接删（先查工作区层再查全局层）；不带则进入删除页
         "deletecmd" => {
             if arg.is_empty() {
@@ -566,10 +607,12 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
         "setting" if arg.is_empty() => enter_settings(ui, root),
         "setting" => {
             // `-g` 前缀写全局便携层（exe 旁 do.config.json），否则写工作区层。
-            // strip_prefix 命中时返回去掉前缀后的剩余切片（Option 语义）
-            let (global, rest) = match arg.strip_prefix("-g") {
-                Some(r) => (true, r.trim()),
-                None => (false, arg),
+            // `-g` 必须是独立词（同 /addcmd）：`-gfoo` 不当开关
+            let mut head = arg.splitn(2, char::is_whitespace);
+            let (global, rest) = if head.next() == Some("-g") {
+                (true, head.next().unwrap_or("").trim())
+            } else {
+                (false, arg)
             };
             let mut kv = rest.splitn(2, char::is_whitespace);
             let field = kv.next().unwrap_or("");
@@ -598,12 +641,14 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
             };
             match result {
                 Ok(msg) => {
-                    if field == "model" {
-                        ui.model = value.to_string();
-                    }
-                    if field == "key" {
-                        ui.has_key = true;
-                    }
+                    // 状态栏显示的是**生效值**：保存后从合并配置重算，
+                    // 不能直接用刚写入的值——写全局层时可能被工作区层
+                    // 同名值覆盖；清空全局 key 而工作区层有 key 时，
+                    // has_key 必须仍为 true，否则会错误拦截提交
+                    let merged =
+                        Config::load_merged(root, agent_core::config::exe_dir().as_deref());
+                    ui.model = merged.model;
+                    ui.has_key = !merged.key.is_empty();
                     ui.items.push(Item::Info(msg));
                 }
                 Err(e) => ui.items.push(Item::Info(e)),
@@ -630,7 +675,7 @@ fn slash(ui: &mut Ui, agent: &mut AgentHandle, root: &Path, rest: &str) {
                 Lang::En => "en",
             };
             // 落盘失败不阻断切换（session 内仍生效），但提示一声
-            if let Err(e) = persist_lang(value) {
+            if let Err(e) = persist_lang(ui.lang, value) {
                 ui.items.push(Item::Info(e));
             }
             // 反馈用**新**语言
@@ -651,8 +696,9 @@ fn ui_lang_fmt(ui: &Ui, global: bool, field: &str) -> String {
 
 /// /lang 持久化：语言是个人偏好，写全局层（exe 旁 do.config.json）。
 /// 拆出 exe 目录参数是为了可测（测试喂临时目录）
-fn persist_lang(value: &str) -> Result<(), String> {
-    let dir = agent_core::config::exe_dir().ok_or_else(|| "exe dir unavailable".to_string())?;
+fn persist_lang(lang: Lang, value: &str) -> Result<(), String> {
+    let dir = agent_core::config::exe_dir()
+        .ok_or_else(|| lang.t(Key::NoExeDir).to_string())?;
     persist_lang_to(&dir, value)
 }
 
@@ -664,10 +710,6 @@ fn persist_lang_to(dir: &Path, value: &str) -> Result<(), String> {
     cfg.save_global(dir).map_err(|e| e.to_string())
 }
 
-/// 进入设置页：载入各字段的**生效值**（合并视图）与来源层。
-/// 修复历史 bug：旧版按"字段归属层"各读单层——若值写在工作区层
-/// （如 `/setting key` 不带 -g），全局字段行就会错误地显示"未设置"。
-/// 显示用合并值；保存纪律不变（写哪层只写哪层，见 settings_save）。
 /// slash 命令候选表：命令名 + 用法文案 key（渲染时按当前语言取）。
 /// 命令名是英文标识符，不翻译
 const SLASH_COMMANDS: &[(&str, Key)] = &[
@@ -689,8 +731,15 @@ fn slash_hint(input: &str, lang: Lang) -> String {
     SLASH_COMMANDS
         .iter()
         // filter + map 链 ≈ C# LINQ 的 Where + Select。
-        // 双向前缀：`/s` 命中 /setting；`/setting m` 也已选定命令，继续显示其用法
-        .filter(|(name, _)| name.starts_with(input) || input.starts_with(name))
+        // 正向：输入是命令名前缀（`/s` 命中 /setting）；
+        // 反向：输入已选定命令，但要求精确命中或命中后紧跟空白——
+        // `/newx` 这类非法输入不该蹭到 /new 的用法提示
+        .filter(|(name, _)| {
+            name.starts_with(input)
+                || input
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        })
         .map(|(_, usage)| lang.t(*usage))
         .collect::<Vec<_>>()
         .join("  ")
@@ -708,7 +757,7 @@ fn tab_complete(ui: &mut Ui) {
 
 /// 工具调用的折叠态渲染：函数调用样式，更接近程序员直觉。
 /// 取各工具主参数：read/write/edit/ls 取 path，grep 取 pattern+path，
-/// start 无参；JSON 解析失败或主参数缺失时兜底 `name()`。
+/// addcmd/runcmd 取 name；JSON 解析失败或主参数缺失时兜底 `name()`。
 fn format_call(name: &str, args_json: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
         return format!("{name}()");
@@ -769,6 +818,22 @@ fn hint_text(ui: &Ui) -> String {
     }
 }
 
+/// 页面类（Settings/Approve/Delete）的渲染起点：默认从尾部截取（详情区在尾部，
+/// 一屏内时与旧行为一致），但选中行移出可视窗时跟随——
+/// 在上沿之上则把起点提到选中行，在下沿之下则下压到刚好露出。
+/// 瘦身版滚动：不维护滚动状态，只保证"选中的永远可见"
+fn page_view_start(total: usize, height: usize, sel: Option<usize>) -> usize {
+    let mut start = total.saturating_sub(height);
+    if let Some(row) = sel {
+        if row < start {
+            start = row;
+        } else if row >= start + height {
+            start = row + 1 - height;
+        }
+    }
+    start
+}
+
 /// 渲染一帧
 fn draw(term: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &Ui) -> io::Result<()> {
     term.draw(|frame| {
@@ -798,10 +863,20 @@ fn draw(term: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &Ui) -> io::Resul
         };
         let height = chunks[0].height as usize;
         let total = lines.len();
-        // 页面类不滚动（内容一屏内），对话流正常滚动
-        let scroll = if ui.mode == Mode::Chat { ui.scroll } else { 0 };
-        let bottom_skip = scroll.min(total.saturating_sub(height));
-        let start = total.saturating_sub(height + bottom_skip);
+        // 对话流正常滚动；页面类（Settings/Approve/Delete）渲染起点跟随
+        // 选中项，保证选中行始终可见（超屏时不再钉死尾部盲操作）
+        let start = if ui.mode == Mode::Chat {
+            let bottom_skip = ui.scroll.min(total.saturating_sub(height));
+            total.saturating_sub(height + bottom_skip)
+        } else {
+            // 页面结构约定：前 2 行是空行 + 标题，列表第 i 项落在逻辑行 2 + i
+            let sel = match ui.mode {
+                Mode::Approve if !ui.pending.is_empty() => Some(2 + ui.appr_sel),
+                Mode::Delete if !ui.del_list.is_empty() => Some(2 + ui.del_sel),
+                _ => None,
+            };
+            page_view_start(total, height, sel)
+        };
         let visible: Vec<Line> = lines
             .into_iter()
             .skip(start)
@@ -894,12 +969,19 @@ fn build_lines(ui: &Ui, width: usize) -> Vec<Line<'static>> {
                 // doing 黄（动画帧随 tick 推进）/ done 绿 / 已取消 红
                 let style = Style::default().fg(Color::Cyan);
                 let (word, word_style) = match result {
-                    None => (ellipsis_frame(ui.tick_count), Style::default().fg(Color::Yellow)),
+                    None => (
+                        ellipsis_frame(ui.lang, ui.tick_count),
+                        Style::default().fg(Color::Yellow),
+                    ),
                     // CANCEL_MARK 是逻辑比较用的内部常量，展示按语言取
-                    Some(r) if r == CANCEL_MARK => {
-                        (ui.lang.t(Key::Cancelled), Style::default().fg(Color::Red))
-                    }
-                    Some(_) => ("done", Style::default().fg(Color::Green)),
+                    Some(r) if r == CANCEL_MARK => (
+                        ui.lang.t(Key::Cancelled).to_string(),
+                        Style::default().fg(Color::Red),
+                    ),
+                    Some(_) => (
+                        ui.lang.t(Key::Done).to_string(),
+                        Style::default().fg(Color::Green),
+                    ),
                 };
                 let line = Line::from(vec![
                     Span::styled(format_call(name, args), style),
@@ -1040,6 +1122,9 @@ mod tests {
         assert!(slash_hint("/setting model g", Lang::Zh).contains("/setting"));
         // 完整命令名命中自身
         assert_eq!(slash_hint("/new", Lang::Zh), "/new");
+        // 非法输入不蹭提示：/newx 不是 /new（词边界）
+        assert!(slash_hint("/newx", Lang::Zh).is_empty());
+        assert!(slash_hint("/quitters", Lang::Zh).is_empty());
     }
 
     #[test]
@@ -1086,7 +1171,7 @@ mod tests {
         );
         assert_eq!(format_call("grep", "{\"pattern\":\"foo\"}"), "grep(\"foo\")");
         assert_eq!(format_call("ls", "{}"), "ls()");
-        assert_eq!(format_call("start", "{}"), "start()");
+        assert_eq!(format_call("runcmd", "{\"name\":\"deploy\"}"), "runcmd(\"deploy\")");
         // JSON 解析失败 / 主参数缺失 → 兜底 name()
         assert_eq!(format_call("read", "not json"), "read()");
         assert_eq!(format_call("write", "{}"), "write()");
@@ -1114,6 +1199,9 @@ mod tests {
         assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("未知命令") && t.contains("/deletecmd")));
         slash(&mut ui, &mut agent, &dir, "allowc");
         assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("未知命令") && t.contains("/allowcmd")));
+        // 未知命令提示列出全部可用命令（含 /lang）
+        slash(&mut ui, &mut agent, &dir, "nosuch");
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("/lang") && t.contains("/setting")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1166,17 +1254,92 @@ mod tests {
 
     #[test]
     fn ellipsis_frame_cycles() {
-        // 每 5 tick 换一帧：doing. → doing.. → doing... → 循环
-        assert_eq!(ellipsis_frame(0), "doing.");
-        assert_eq!(ellipsis_frame(4), "doing.");
-        assert_eq!(ellipsis_frame(5), "doing..");
-        assert_eq!(ellipsis_frame(10), "doing...");
-        assert_eq!(ellipsis_frame(15), "doing."); // 回绕
+        // 每 5 tick 换一帧：点号 1→2→3 循环；状态字走 lang 表（双语）
+        assert_eq!(ellipsis_frame(Lang::En, 0), "doing.");
+        assert_eq!(ellipsis_frame(Lang::En, 4), "doing.");
+        assert_eq!(ellipsis_frame(Lang::En, 5), "doing..");
+        assert_eq!(ellipsis_frame(Lang::En, 10), "doing...");
+        assert_eq!(ellipsis_frame(Lang::En, 15), "doing."); // 回绕
+        assert_eq!(ellipsis_frame(Lang::Zh, 0), "执行中."); // 中文界面
+    }
+
+    #[test]
+    fn tick_redraw_only_when_animating() {
+        // dirty 标志的 tick 侧判定：无进行中工具块 → tick 不触发重绘
+        // （idle 时不再每秒全量重建 10 次）；有进行中块 → 动画要推进，重绘
+        let mut ui = test_ui();
+        ui.items.push(Item::Assistant("答完了".into()));
+        assert!(!needs_anim_frame(&ui));
+        // 已完成/已取消的工具块同样不需要动画帧
+        ui.items.push(Item::Tool { name: "ls".into(), args: "{}".into(), result: Some("ok".into()) });
+        ui.items.push(Item::Tool { name: "grep".into(), args: "{}".into(), result: Some(CANCEL_MARK.into()) });
+        assert!(!needs_anim_frame(&ui));
+        // 出现进行中块 → 需要 tick 驱动重绘
+        ui.items.push(Item::Tool { name: "read".into(), args: "{}".into(), result: None });
+        assert!(needs_anim_frame(&ui));
+    }
+
+    #[test]
+    fn parallel_tool_results_backfill_fifo() {
+        // 并行调用：模型一次发多个 tool_calls，ToolBegin 连续建两个 doing 块。
+        // 第一个完成的结果必须落回第一个块（FIFO），不能串到最后一块
+        let mut ui = test_ui();
+        handle_agent(&mut ui, Evt::ToolStart { name: "read".into(), args: String::new() });
+        handle_agent(&mut ui, Evt::ToolStart { name: "ls".into(), args: String::new() });
+        handle_agent(&mut ui, Evt::Tool {
+            name: "read".into(),
+            args: "{\"path\":\"a.rs\"}".into(),
+            result: "r1".into(),
+        });
+        match &ui.items[0] {
+            Item::Tool { name, result, .. } => {
+                assert_eq!(name, "read");
+                assert_eq!(result.as_deref(), Some("r1"));
+            }
+            _ => panic!("应为 Tool 块"),
+        }
+        // 第二个块仍是进行中，且名字没被覆盖
+        assert!(
+            matches!(&ui.items[1], Item::Tool { name, result: None, .. } if name == "ls")
+        );
+        // 第二个结果回填第二个块
+        handle_agent(&mut ui, Evt::Tool { name: "ls".into(), args: "{}".into(), result: "r2".into() });
+        assert!(matches!(&ui.items[1], Item::Tool { result: Some(r), .. } if r == "r2"));
+        assert_eq!(ui.items.len(), 2); // 不新增块
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn setting_save_refreshes_status_from_merged() {
+        // 保存后状态栏按合并生效值重算，而非直接用刚写入的值
+        let dir = std::env::temp_dir().join(format!("doagent-setm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut agent = AgentHandle::start(&dir).unwrap();
+        let mut ui = test_ui();
+        // 写工作区层 model：工作区层优先级最高，生效值必为刚写入的值
+        slash(&mut ui, &mut agent, &dir, "setting model ws-model");
+        assert_eq!(ui.model, "ws-model");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_view_start_follows_selection() {
+        // 一屏内：起点 0，全部可见
+        assert_eq!(page_view_start(5, 10, Some(2)), 0);
+        // 超屏、选中在尾部视窗内：保持尾部（详情区在尾部可见）
+        assert_eq!(page_view_start(20, 10, Some(15)), 10);
+        assert_eq!(page_view_start(20, 10, None), 10);
+        // 选中在上沿之上：起点提到选中行（向上跟随）
+        assert_eq!(page_view_start(20, 10, Some(3)), 3);
+        assert_eq!(page_view_start(20, 10, Some(0)), 0);
+        // 选中在下沿之下：下压到刚好露出（防御分支，正常选中不会越界）
+        assert_eq!(page_view_start(20, 10, Some(25)), 16);
     }
 
     #[test]
     fn tool_status_word_colors() {
-        // 三态分色：doing 黄 / done 绿 / 已取消 红；工具名保持青色
+        // 三态分色：执行中 黄 / 完成 绿 / 已取消 红；工具名保持青色
+        // （夹具语言为 Zh，状态字断言中文案）
         let mut ui = test_ui();
         ui.items.push(Item::Tool { name: "read".into(), args: "{\"path\":\"a.rs\"}".into(), result: None });
         ui.items.push(Item::Tool { name: "ls".into(), args: "{}".into(), result: Some("x".into()) });
@@ -1184,8 +1347,8 @@ mod tests {
         let lines = build_lines(&ui, 80);
         // 每条工具块一行两 span：[青色函数调用, 分色状态字]
         let status = |i: usize| (lines[i].spans[1].content.to_string(), lines[i].spans[1].style.fg);
-        assert_eq!(status(0), (" doing.".to_string(), Some(Color::Yellow)));
-        assert_eq!(status(1), (" done".to_string(), Some(Color::Green)));
+        assert_eq!(status(0), (" 执行中.".to_string(), Some(Color::Yellow)));
+        assert_eq!(status(1), (" 完成".to_string(), Some(Color::Green)));
         assert_eq!(status(2), (" （已取消）".to_string(), Some(Color::Red)));
         for line in &lines {
             assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
@@ -1218,6 +1381,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut agent = AgentHandle::start(&dir).unwrap();
         let mut ui = test_ui(); // 夹具默认 Zh
+        // slash 路径会写真实 exe 旁的 do.config.json（persist_lang 走 exe_dir）。
+        // 先备份原文件，结束还原：不能毁掉用户真实配置——
+        // 旧版直接整文件删除，跑个测试就把全局配置抹了
+        let backup = agent_core::config::exe_dir().and_then(|d| {
+            let f = d.join("do.config.json");
+            std::fs::read(&f).ok().map(|bytes| (f, bytes))
+        });
         // 显式设置
         slash(&mut ui, &mut agent, &dir, "lang en");
         assert_eq!(ui.lang, Lang::En);
@@ -1231,9 +1401,17 @@ mod tests {
         slash(&mut ui, &mut agent, &dir, "lang fr");
         assert_eq!(ui.lang, Lang::Zh); // 不变
         assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("/lang [zh|en]")));
-        // 清理：slash 路径会写真实 exe 旁的 do.config.json
+        // 还原 exe 旁配置：原本有就写回原内容，原本没有才删掉测试产物
         if let Some(d) = agent_core::config::exe_dir() {
-            let _ = std::fs::remove_file(d.join("do.config.json"));
+            let f = d.join("do.config.json");
+            match &backup {
+                Some((_, bytes)) => {
+                    let _ = std::fs::write(&f, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&f);
+                }
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

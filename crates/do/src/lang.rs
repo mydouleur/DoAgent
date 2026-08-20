@@ -47,6 +47,9 @@ impl Lang {
                 "审计日志不可写，已关闭（do.audit.jsonl）",
             ),
             Key::Cancelled => ("(cancelled)", "（已取消）"),
+            // 工具状态字：doing 的点号动画帧在调用方拼（点号是中性符号不翻译）
+            Key::Doing => ("doing", "执行中"),
+            Key::Done => ("done", "完成"),
             Key::ErrorPrefix => ("error: {}", "错误: {}"),
             // ---- hint 行 ----
             Key::HintSettings => (
@@ -100,8 +103,8 @@ impl Lang {
             Key::UpdatedField => ("updated {}", "已更新 {}"),
             Key::UpdatedGlobalField => ("updated global {}", "已更新 全局 {}"),
             Key::UnknownCmd => (
-                "unknown command (/setting /new /addcmd /allowcmd /deletecmd /quit)",
-                "未知命令（/setting /new /addcmd /allowcmd /deletecmd /quit）",
+                "unknown command (/setting /new /addcmd /allowcmd /deletecmd /lang /quit)",
+                "未知命令（/setting /new /addcmd /allowcmd /deletecmd /lang /quit）",
             ),
             Key::ProposalArrived => (
                 "command proposal: {} = `{}` ({}), /allowcmd to review",
@@ -166,6 +169,8 @@ pub enum Key {
     GlobalLayerUnavailable,
     AuditDisabled,
     Cancelled,
+    Doing,
+    Done,
     ErrorPrefix,
     HintSettings,
     HintSettingsEdit,
@@ -228,6 +233,8 @@ pub const ALL_KEYS: &[Key] = &[
     Key::GlobalLayerUnavailable,
     Key::AuditDisabled,
     Key::Cancelled,
+    Key::Doing,
+    Key::Done,
     Key::ErrorPrefix,
     Key::HintSettings,
     Key::HintSettingsEdit,
@@ -291,8 +298,10 @@ mod tests {
             assert!(!Lang::En.t(*key).is_empty(), "{key:?}");
             assert!(!Lang::Zh.t(*key).is_empty(), "{key:?}");
         }
-        // ALL_KEYS 覆盖性：变体数应与枚举一致（漏加 key 时此处会落后）
-        assert_eq!(ALL_KEYS.len(), 57);
+        // ALL_KEYS 覆盖性：应等于 Key 变体数（手工同步，加变体时 +1）。
+        // Rust 没有编译期枚举变体计数的内建手段，为一个数字引入宏 crate
+        // 不值（依赖克制），就用魔法数 + 本注释兜底
+        assert_eq!(ALL_KEYS.len(), 59);
     }
 
     #[test]

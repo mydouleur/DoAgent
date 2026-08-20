@@ -59,6 +59,8 @@ struct Renderer {
     in_code_block: bool,
     /// 列表嵌套深度（决定缩进）
     list_depth: usize,
+    /// 各层有序列表的当前序号（None = 无序层）；与 list_depth 平行入栈
+    list_nums: Vec<Option<u64>>,
     /// 引用块嵌套深度（每行前缀 "│ " 的层数）
     quote_depth: usize,
     /// 当前行是否已写入内容（引用/列表前缀只在行首插一次）
@@ -115,15 +117,26 @@ impl Renderer {
                 self.quote_depth += 1;
                 self.styles.push(STYLE_QUOTE);
             }
-            Tag::List(_) => {
+            Tag::List(start) => {
                 self.break_line();
                 self.list_depth += 1;
+                // 有序列表记下起始序号（pulldown-cmark 给 Option<u64>，None = 无序）
+                self.list_nums.push(start);
             }
             Tag::Item => {
                 self.break_line();
-                // 列表项行首：按嵌套深度缩进 + "- " 标记
+                // 列表项行首：按嵌套深度缩进 + 标记。
+                // 有序层输出当前序号并自增（`{n}. `）；无序层保持 "- "
                 let indent = "  ".repeat(self.list_depth.saturating_sub(1));
-                self.push_span(&format!("{indent}- "), self.style());
+                let marker = match self.list_nums.last_mut() {
+                    Some(Some(n)) => {
+                        let m = format!("{indent}{n}. ");
+                        *n += 1;
+                        m
+                    }
+                    _ => format!("{indent}- "),
+                };
+                self.push_span(&marker, self.style());
             }
             Tag::Emphasis => self.styles.push(STYLE_EMPHASIS),
             Tag::Strong => self.styles.push(STYLE_STRONG),
@@ -152,6 +165,7 @@ impl Renderer {
             }
             TagEnd::List(_) => {
                 self.list_depth -= 1;
+                self.list_nums.pop();
                 self.break_line();
             }
             TagEnd::Item => self.break_line(),
@@ -175,17 +189,19 @@ impl Renderer {
                 }
             }
         } else {
-            // 行首才补引用前缀（│ 层级标记）
-            if !self.line_started && self.quote_depth > 0 {
-                let prefix = "│ ".repeat(self.quote_depth);
-                self.push_span(&prefix, STYLE_QUOTE);
-            }
             let style = self.style();
             self.push_span(t, style);
         }
     }
 
     fn push_span(&mut self, text: &str, style: Style) {
+        // 引用前缀统一在这里补齐：不只 Text，行内代码（Code）、列表项标记等
+        // 独立事件也走 push_span——若只在 on_text 补，行首是行内代码的引用行
+        // 会丢 "│ " 前缀。代码块内不补（块内行首是代码原文，非引用排版）
+        if !self.line_started && !self.in_code_block && self.quote_depth > 0 {
+            let prefix = "│ ".repeat(self.quote_depth);
+            self.cur.push(Span::styled(prefix, STYLE_QUOTE));
+        }
         self.line_started = true;
         self.cur.push(Span::styled(text.to_string(), style));
     }
@@ -211,10 +227,10 @@ impl Renderer {
 
     fn finish(mut self) -> Vec<Line<'static>> {
         self.break_line();
-        // 去掉可能残留的首尾空行（文档开头/结尾不锚空行）
-        while self.lines.first().is_some_and(|l| l.spans.is_empty()) {
-            self.lines.remove(0);
-        }
+        // 去掉可能残留的首尾空行（文档开头/结尾不锚空行）。
+        // 首部一次性 drain：remove(0) 循环每次都要把后续元素整体搬移
+        let head = self.lines.iter().take_while(|l| l.spans.is_empty()).count();
+        self.lines.drain(..head);
         while self.lines.last().is_some_and(|l| l.spans.is_empty()) {
             self.lines.pop();
         }
@@ -336,5 +352,27 @@ mod tests {
         assert_eq!(texts("头\n# 题\n尾"), ["头", "", "题", "", "尾"]);
         // 文档开头的标题：前面不锚空行
         assert_eq!(texts("# 题\n尾"), ["题", "", "尾"]);
+    }
+
+    #[test]
+    fn ordered_list_keeps_numbers() {
+        // 有序列表按起始序号渲染并自增，不再全部退化成 "- "
+        assert_eq!(texts("1. 甲\n2. 乙\n3. 丙"), ["1. 甲", "2. 乙", "3. 丙"]);
+        // 非 1 起始也尊重
+        assert_eq!(texts("5. 甲\n6. 乙"), ["5. 甲", "6. 乙"]);
+        // 无序列表保持 "- "
+        assert_eq!(texts("- 甲\n- 乙"), ["- 甲", "- 乙"]);
+    }
+
+    #[test]
+    fn quote_line_starting_with_inline_code_keeps_prefix() {
+        // 行首是行内代码的引用行也要补 "│ " 前缀（Code 事件同样走 push_span）
+        let lines = render("> `code` 后文");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("│ "), "{text}");
+        assert!(text.contains("code"));
+        // 代码 span 仍是行内代码样式（前缀没有吞掉样式）
+        let code = lines[0].spans.iter().find(|s| s.content == "code").unwrap();
+        assert_eq!(code.style.fg, Some(Color::Yellow));
     }
 }

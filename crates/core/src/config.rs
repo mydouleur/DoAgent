@@ -101,16 +101,24 @@ impl Config {
             url: pick([ws.url, global.url, def.url]),
             key: pick([ws.key, global.key, def.key]),
             model: pick([ws.model, global.model, def.model]),
-            lang: pick([ws.lang, global.lang, def.lang]),
+            // lang 只属于全局层（身份项，只由 /lang 写入）：工作区层即使残留
+            // "lang" 字段也忽略——否则残留会按"工作区优先"静默压制 /lang 切换
+            lang: if global.lang.is_empty() { def.lang } else { global.lang },
         }
     }
 
     /// 写工作区层 `.do/config.json`（目录不存在则先建）。
+    /// 显式列字段而不序列化整个 self：lang 不落工作区层——它是身份项只归
+    /// 全局层，一旦写进工作区层会形成残留（见 load_merged 的 lang 取值）
     pub fn save(&self, root: &Path) -> io::Result<()> {
         let dir = root.join(".do");
         std::fs::create_dir_all(&dir)?;
-        let text = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "url": self.url,
+            "key": self.key,
+            "model": self.model,
+        }))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(dir.join("config.json"), text)
     }
 
@@ -141,7 +149,8 @@ impl Config {
         Ok(())
     }
 
-    /// 修改全局层的某一项（与 set 同规则；保留入口仅为 /setting -g 语义对称）。
+    /// 修改全局层的某一项：纯透传到 set（同一套字段校验，零附加逻辑），
+    /// 独立入口只为让 /setting -g 的调用点读起来对准目标层。
     pub fn set_global(&mut self, field: &str, value: &str) -> Result<(), String> {
         self.set(field, value)
     }
@@ -224,5 +233,31 @@ mod tests {
         assert_eq!(back.lang, "zh");
         assert!(std::fs::read_to_string(exe.join(GLOBAL_FILE)).unwrap().contains("\"lang\""));
         let _ = std::fs::remove_dir_all(&exe);
+    }
+
+    #[test]
+    fn workspace_lang_residue_ignored() {
+        let (ws, exe) = (temp_dir("lrw"), temp_dir("lre"));
+        // 工作区层手写残留 "lang"：合并仍取全局层，/lang 切换不被压制
+        std::fs::create_dir_all(ws.join(".do")).unwrap();
+        std::fs::write(ws.join(".do/config.json"), "{\"lang\": \"en\", \"model\": \"m\"}").unwrap();
+        let g = Config { lang: "zh".to_string(), ..Config::default() };
+        g.save_global(&exe).unwrap();
+        let merged = Config::load_merged(&ws, Some(&exe));
+        assert_eq!(merged.lang, "zh");
+        assert_eq!(merged.model, "m"); // 其它字段的工作区优先不受影响
+        // 全局层为空时回落默认（空），而不是工作区残留
+        let exe2 = temp_dir("lre2");
+        assert!(Config::load_merged(&ws, Some(&exe2)).lang.is_empty());
+        // save 不再把 lang 写进工作区层，从源头杜绝残留
+        let w = Config { lang: "en".to_string(), ..Config::default() };
+        w.save(&ws).unwrap();
+        let text = std::fs::read_to_string(ws.join(".do/config.json")).unwrap();
+        assert!(!text.contains("\"lang\""), "{text}");
+        let _ = (
+            std::fs::remove_dir_all(&ws),
+            std::fs::remove_dir_all(&exe),
+            std::fs::remove_dir_all(&exe2),
+        );
     }
 }

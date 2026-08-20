@@ -34,7 +34,7 @@ cargo clippy --all-targets  # 必须零警告
 
 ### 工具（固定 7 个）
 
-read（≤400 行）/ write / edit（精确替换，多处未 all 则报错）/ ls（≤200 条）/ grep（regex-lite，≤100 匹配）/ addcmd（AI 提案固定命令：name 限 `^[a-zA-Z0-9_-]+$`、command、description、mode=once|daemon）/ runcmd（无参列白名单、带名执行；once 等结束取尾 20 KB，daemon 后台即返）
+read（≤400 行）/ write / edit（精确替换，多处未 all 则报错；old 拒绝空串——`matches("")` 命中 len+1 处，配 all=true 会毁文件）/ ls（≤200 条）/ grep（regex-lite，≤100 匹配；命中文件先 canonicalize 再判 `.do`，堵 symlink 绕行）/ addcmd（AI 提案固定命令：name 限 `^[a-zA-Z0-9_-]+$`、command、description、mode=once|daemon）/ runcmd（无参列白名单、带名执行；once 等结束取尾 20 KB、10 分钟超时杀进程（kill_on_drop），daemon 后台即返）
 
 ### 命令白名单
 
@@ -46,7 +46,7 @@ read（≤400 行）/ write / edit（精确替换，多处未 all 则报错）/ 
 
 ### 配置（双层，覆盖合并）
 
-工作区 `.do/config.json`（优先）> exe 旁 `do.config.json` > 内置默认。全局层存 url/key/model/lang（"人"的身份）。`/setting [-g] <url|key|model> <值>`；裸 `/setting` 开设置页（显示合并生效值 + 来源标注，key 掩码）。`/lang [zh|en]` 切换语言（lang 只由 /lang 写入，/setting 拒绝该字段）。
+工作区 `.do/config.json`（优先）> exe 旁 `do.config.json` > 内置默认。全局层存 url/key/model/lang（"人"的身份）。`/setting [-g] <url|key|model> <值>`；裸 `/setting` 开设置页（显示合并生效值 + 来源标注，key 掩码）。`/lang [zh|en]` 切换语言（lang 只由 /lang 写入，/setting 拒绝该字段；合并只取全局层——工作区层残留 `"lang"` 一律忽略，save 也不向工作区层落 lang）。
 
 ### 上下文
 
@@ -64,6 +64,9 @@ read（≤400 行）/ write / edit（精确替换，多处未 all 则报错）/ 
 - `.do/` 隐形（见约定 1）；write 例外返回 os error 5（写入不存在路径本应成功，报"不存在"会自相矛盾）
 - realpath + 大小写归一后比较（Windows：`.DO`、`.do `、`.do.` 都是 `.do`）；symlink 逃逸被 realpath 天然挡住
 - 固有残余（接受）：命令执行时读取的项目文件是 AI 可写的——"让 AI 写代码"的固有属性，不归沙盒管
+- 固有残余（接受）：write/edit 非原子写（截断后重写，中途崩溃留半文件）——修要 tempfile 类依赖 + Windows 占用重试分支，场景有 git 兜底，不值
+- 固有残余（接受）：resolve 校验与 fs 操作间的 TOCTOU 窗口——能在窗口期换 symlink 的实体本就有本地写权限，防的是"门内的人翻窗"，无意义
+- 有意取舍：`.do` 名归一化全平台统一套用 Windows 语义（Linux 上 `.DO`/`.do ` 也隐形）——工具只建小写 `.do`，误伤仅限手工同名目录且后果只是 AI 不可见；换来全平台行为一致
 
 ### TLS 与平台产物
 
@@ -78,6 +81,7 @@ win（Schannel）/ mac（Security.framework）/ linux-gnu（系统 OpenSSL 3）�
 - **全局命令层 + JSONL 审计**：见上文规格
 - **i18n + 紧凑布局 + /lang**：lang.rs 静态表（编译器强制双语齐全）；md 渲染三层策略——段落/列表/引用零空行，空行只在标题/代码块/分隔线边界且幂等去重；修复标题样式栈泄漏
 - **实验否决记录**：主流 agent（Kimi Code/OpenCode）流式中段不显示任何工具信息——DoAgent 的提前宣告已领先，空括号宽容提取不做
+- **健壮性批次**：SSE 120s 空闲超时（不用总超时，防误杀长生成）+ reqwest Client 整轮复用；工具往返上限 16 打满注入说明并记审计；取消路径保证 ToolStart 先于 Tool；edit 拒空 old；once 命令 10 分钟超时；Layer enum 替代中文标签传层语义（i18n 归展示层）；TOOL_NAMES 单一事实源；tick 脏标志跳过 idle 重渲染
 
 ## 技术选型存档（仅留档）
 

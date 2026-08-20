@@ -7,10 +7,11 @@
 use super::{Item, Mode, Ui, SETTINGS_FIELDS};
 use crate::lang::Key;
 use agent_core::config::Config;
-use agent_core::{AgentHandle, Cmd};
+use agent_core::{AgentHandle, Cmd, Layer};
 use crossterm::event::KeyCode;
 use std::path::Path;
 
+/// Settings 模式的按键：选择 / 编辑 / 退出
 pub(super) fn settings_key(ui: &mut Ui, code: KeyCode, root: &Path) {
     // 编辑态：Enter 保存、Esc 放弃、字符进缓冲
     if ui.set_editing.is_some() {
@@ -131,10 +132,8 @@ fn approve_current(ui: &mut Ui, agent: &mut AgentHandle, root: &Path) {
         Some(d) => agent_core::commands::load_global(d),
         None => agent_core::commands::load(root),
     };
-    // 与内建工具或同层已批准命令重名 = 拒绝（覆盖已有工具太危险）。
-    // start 是隐式保留名（白名单视图会合并 config.start），一并保护
-    const BUILTIN: &[&str] = &["read", "write", "edit", "ls", "grep", "addcmd", "runcmd"];
-    if BUILTIN.contains(&name.as_str()) || cmds.iter().any(|c| c.name == name) {
+    // 与内建工具或同层已批准命令重名 = 拒绝（覆盖已有工具太危险）
+    if agent_core::TOOL_NAMES.contains(&name.as_str()) || cmds.iter().any(|c| c.name == name) {
         ui.items.push(Item::Info(ui.lang.t(Key::NameConflict).replace("{}", &name)));
         return;
     }
@@ -191,22 +190,26 @@ pub(super) fn delete_key(ui: &mut Ui, code: KeyCode, root: &Path) {
         }
         KeyCode::Enter => {
             if ui.del_sel < ui.del_list.len() {
-                let (gone, src) = ui.del_list.remove(ui.del_sel);
+                let (gone, layer) = ui.del_list.remove(ui.del_sel);
                 // 按来源层删：读该层名单、retain、写回
-                let result = if src == "全局" {
-                    agent_core::config::exe_dir().map(|d| {
+                let result = match layer {
+                    Layer::Global => agent_core::config::exe_dir().map(|d| {
                         let mut cmds = agent_core::commands::load_global(&d);
                         cmds.retain(|c| c.name != gone.name);
                         agent_core::commands::save_global(&d, &cmds)
-                    })
-                } else {
-                    let mut cmds = agent_core::commands::load(root);
-                    cmds.retain(|c| c.name != gone.name);
-                    Some(agent_core::commands::save(root, &cmds))
+                    }),
+                    Layer::Workspace => {
+                        let mut cmds = agent_core::commands::load(root);
+                        cmds.retain(|c| c.name != gone.name);
+                        Some(agent_core::commands::save(root, &cmds))
+                    }
                 };
                 match result {
                     Some(Ok(())) => {
-                        let key = if src == "全局" { Key::RevokedGlobal } else { Key::Revoked };
+                        let key = match layer {
+                            Layer::Global => Key::RevokedGlobal,
+                            Layer::Workspace => Key::Revoked,
+                        };
                         ui.items.push(Item::Info(ui.lang.t(key).replace("{}", &gone.name)));
                     }
                     Some(Err(e)) => ui.items.push(Item::Info(e.to_string())),
@@ -245,13 +248,12 @@ fn settings_save(ui: &mut Ui, root: &Path, value: String) {
             // 重新载入合并视图：显示始终是生效值（若被更高优先级层
             // 覆盖，保存的值不会出现在显示里——这正是覆盖语义）
             load_settings(ui, root);
-            // 两层都影响状态栏，保存后刷新
-            if field == "model" {
-                ui.model = value.clone();
-            }
-            if field == "key" {
-                ui.has_key = !value.is_empty();
-            }
+            // 状态栏两个字段同样按合并生效值重算：直接用刚写入的值会
+            // 无视层覆盖（如清空全局 key 而工作区层有 key 时 has_key
+            // 必须仍为 true，否则错误拦截提交）
+            let merged = Config::load_merged(root, agent_core::config::exe_dir().as_deref());
+            ui.model = merged.model;
+            ui.has_key = !merged.key.is_empty();
             let key = if global { Key::UpdatedGlobalField } else { Key::UpdatedField };
             ui.items.push(Item::Info(ui.lang.t(key).replace("{}", field)));
         }
@@ -259,7 +261,10 @@ fn settings_save(ui: &mut Ui, root: &Path, value: String) {
     }
 }
 
-/// agent 事件处理：流式增量拼到对话流最后一条同类记录上
+/// 进入设置页：载入各字段的**生效值**（合并视图）与来源层，复位选中/编辑态。
+/// 历史 bug 记录：旧版按"字段归属层"各读单层——若值写在工作区层
+/// （如 `/setting key` 不带 -g），全局字段行就会错误地显示"未设置"。
+/// 显示用合并值；保存纪律不变（写哪层只写哪层，见 settings_save）。
 pub(super) fn enter_settings(ui: &mut Ui, root: &Path) {
     load_settings(ui, root);
     ui.set_sel = 0;
@@ -327,6 +332,25 @@ mod tests {
         // 不带 -g：工作区层
         slash(&mut ui, &mut agent, &dir, "addcmd local echo x");
         assert!(!ui.pending[1].global);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn addcmd_g_requires_word_boundary() {
+        let dir = std::env::temp_dir().join(format!("doagent-tuigb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut agent = AgentHandle::start(&dir).unwrap();
+        let mut ui = test_ui();
+        // `-gfoo` 不是 -g 开关：整体当 name（连字符是合法命名字符），按工作区层注册
+        slash(&mut ui, &mut agent, &dir, "addcmd -gfoo echo x");
+        assert_eq!(ui.pending.len(), 1);
+        assert!(!ui.pending[0].global);
+        assert_eq!(ui.pending[0].name, "-gfoo");
+        assert_eq!(ui.pending[0].command, "echo x");
+        // /setting 同理：`-gkey` 不当开关，落入未知字段提示
+        slash(&mut ui, &mut agent, &dir, "setting -gkey abc");
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("未知配置项")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -442,6 +466,37 @@ mod tests {
         assert_eq!(ui.pending.len(), 1);
         slash(&mut ui, &mut agent, &dir, "allowcmd");
         assert_eq!(ui.mode, Mode::Approve);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_key_removes_from_layer_indicated_by_enum() {
+        // Layer 枚举驱动删除落盘：工作区层条目 Enter 后从工作区层文件消失
+        let dir = std::env::temp_dir().join(format!("doagent-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmd = |n: &str| ApprovedCommand {
+            name: n.into(),
+            command: format!("echo {n}"),
+            description: String::new(),
+            mode: "once".into(),
+            global: false,
+        };
+        agent_core::commands::save(&dir, &[cmd("keep"), cmd("gone")]).unwrap();
+        let mut ui = test_ui();
+        ui.del_list = agent_core::commands::merged(&dir, None);
+        assert_eq!(ui.del_list.len(), 2);
+        assert!(ui.del_list.iter().all(|(_, l)| *l == Layer::Workspace));
+        ui.mode = Mode::Delete;
+        // 选中第二条（gone）删除：工作区层名单只剩 keep
+        ui.del_sel = 1;
+        delete_key(&mut ui, KeyCode::Enter, &dir);
+        let left = agent_core::commands::load(&dir);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "keep");
+        assert!(matches!(ui.items.last(), Some(Item::Info(t)) if t.contains("已撤销: gone")));
+        // 列表还剩一条：留在删除页
+        assert_eq!(ui.mode, Mode::Delete);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

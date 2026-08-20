@@ -38,8 +38,6 @@ fn mask_key(key: &str) -> String {
     }
 }
 
-/// slash 命令候选表：命令名 + 用法提示（渲染在状态栏上方的提示行）
-/// 数组 + 切片 ≈ C# 的静态只读表；零分配、零组件，够用就好。
 // logo 配色：实心方块 █ = #ff006e（品红），点状方块 ░ = #ccff00（荧光绿）
 const SOLID: Color = Color::Rgb(0xcc, 0xff, 0x00);
 const DOTTED: Color = Color::Rgb(0xff, 0x00, 0x6e);
@@ -210,18 +208,18 @@ pub(super) fn delete_lines(ui: &Ui) -> Vec<Line<'static>> {
         ui.lang.t(Key::DeleteHeader),
         Style::default().fg(Color::DarkGray),
     )));
-    for (i, (c, src)) in ui.del_list.iter().enumerate() {
+    for (i, (c, layer)) in ui.del_list.iter().enumerate() {
         let selected = i == ui.del_sel;
         let style = if selected {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
-        // src 来自 core 的合并视图（中文标签），展示时按界面语言映射
-        let src_disp = if *src == "全局" {
-            ui.lang.t(Key::SrcGlobal)
-        } else {
-            ui.lang.t(Key::SrcWorkspace)
+        // 来源层是 core 的 Layer 枚举（无语义字符串），
+        // 展示文案复用设置页的来源标注 Key（同概念同措辞）
+        let src_disp = match layer {
+            agent_core::Layer::Global => ui.lang.t(Key::SrcGlobal),
+            agent_core::Layer::Workspace => ui.lang.t(Key::SrcWorkspace),
         };
         out.push(Line::from(Span::styled(
             format!(
