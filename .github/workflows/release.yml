@@ -53,7 +53,7 @@ jobs:
             target: aarch64-apple-darwin
             name: do-macos-aarch64
           # macOS Intel
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             name: do-macos-x86_64
     runs-on: ${{ matrix.os }}
